@@ -47,9 +47,13 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox, font as tkfont
 
-import numpy as np
-import cv2
-from PIL import Image, ImageTk
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageEnhance, ImageFile, ImageFilter, ImageFont, ImageTk
+
+# Frames arrive over UDP, so a packet is occasionally lost and the JPEG for
+# that frame is incomplete. Decoding what did arrive keeps the picture live
+# instead of dropping the frame outright.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # ==========================================================================
 # APPLICATION CONSTANTS
@@ -131,6 +135,151 @@ def stop_packet():
 
 START = start_packet()
 STOP = stop_packet()
+
+
+class MjpegAviWriter:
+    """Writes Motion-JPEG video into an AVI container.
+
+    The camera already hands us JPEG frames and every capture is re-encoded as
+    JPEG anyway, so recording is just a matter of wrapping those frames in an
+    AVI. Doing it here rather than through OpenCV's VideoWriter keeps the whole
+    OpenCV/NumPy stack out of the application - the program is a fraction of
+    the size and starts much faster - and MJPEG AVI plays in Windows Media
+    Player, VLC, PowerPoint and every common editor.
+
+    Sizes that are only known once recording stops (total frames, chunk sizes)
+    are written as placeholders and patched in close().
+    """
+
+    def __init__(self, path, width, height, fps, quality=90):
+        self.path = Path(path)
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = max(int(fps), 1)
+        self.quality = quality
+        self.frames = 0
+        self._index = []                 # (offset from 'movi', payload size)
+        self._file = open(self.path, "wb")
+        self._write_headers()
+
+    # -- little-endian helpers ----------------------------------------
+    @staticmethod
+    def _u32(value):
+        return struct.pack("<I", value & 0xFFFFFFFF)
+
+    @staticmethod
+    def _u16(value):
+        return struct.pack("<H", value & 0xFFFF)
+
+    def _write_headers(self):
+        f = self._file
+        w, h, fps = self.width, self.height, self.fps
+
+        # --- main AVI header (56 bytes) ---
+        avih = b"".join((
+            self._u32(1000000 // fps),   # microseconds per frame
+            self._u32(0),                # max bytes per second
+            self._u32(0),                # padding granularity
+            self._u32(0x10),             # AVIF_HASINDEX
+            self._u32(0),                # total frames - patched later
+            self._u32(0),                # initial frames
+            self._u32(1),                # streams
+            self._u32(w * h * 3),        # suggested buffer size
+            self._u32(w), self._u32(h),
+            self._u32(0), self._u32(0), self._u32(0), self._u32(0),
+        ))
+
+        # --- stream header (56 bytes) ---
+        strh = b"".join((
+            b"vids", b"MJPG",
+            self._u32(0), self._u16(0), self._u16(0),
+            self._u32(0),                # initial frames
+            self._u32(1),                # scale
+            self._u32(fps),              # rate -> fps = rate/scale
+            self._u32(0),                # start
+            self._u32(0),                # length - patched later
+            self._u32(w * h * 3),        # suggested buffer size
+            self._u32(0xFFFFFFFF),       # quality: default
+            self._u32(0),                # sample size
+            self._u16(0), self._u16(0), self._u16(w), self._u16(h),
+        ))
+
+        # --- bitmap info header (40 bytes) ---
+        strf = b"".join((
+            self._u32(40),
+            self._u32(w), self._u32(h),
+            self._u16(1), self._u16(24),
+            b"MJPG",
+            self._u32(w * h * 3),
+            self._u32(0), self._u32(0), self._u32(0), self._u32(0),
+        ))
+
+        strl = b"strh" + self._u32(len(strh)) + strh + \
+               b"strf" + self._u32(len(strf)) + strf
+        hdrl = b"avih" + self._u32(len(avih)) + avih + \
+               b"LIST" + self._u32(len(strl) + 4) + b"strl" + strl
+
+        f.write(b"RIFF")
+        self._riff_size_pos = f.tell()
+        f.write(self._u32(0))            # RIFF size - patched later
+        f.write(b"AVI ")
+        f.write(b"LIST" + self._u32(len(hdrl) + 4) + b"hdrl" + hdrl)
+
+        # Remember where the patchable fields live.
+        hdrl_start = self._riff_size_pos + 4 + 4 + 8 + 4   # -> 'avih' fourcc
+        self._avih_frames_pos = hdrl_start + 8 + 16
+        self._strh_length_pos = hdrl_start + 8 + 56 + 12 + 8 + 32
+
+        f.write(b"LIST")
+        self._movi_size_pos = f.tell()
+        f.write(self._u32(0))            # 'movi' size - patched later
+        self._movi_pos = f.tell()        # position of the 'movi' fourcc
+        f.write(b"movi")
+
+    def write(self, image):
+        """Append one frame. `image` is a Pillow image."""
+        # Every frame in an AVI must be the same size. Rotating or flipping
+        # mid-recording changes the frame dimensions, so fit it back to the
+        # size the file was opened with rather than corrupting the stream.
+        if image.size != (self.width, self.height):
+            image = image.resize((self.width, self.height), Image.BILINEAR)
+        buffer = BytesIO()
+        image.save(buffer, "JPEG", quality=self.quality)
+        payload = buffer.getvalue()
+
+        f = self._file
+        offset = f.tell() - self._movi_pos
+        f.write(b"00dc" + self._u32(len(payload)) + payload)
+        if len(payload) & 1:
+            f.write(b"\x00")             # chunks are word-aligned
+        self._index.append((offset, len(payload)))
+        self.frames += 1
+
+    def close(self):
+        if self._file is None:
+            return
+        f = self._file
+        movi_end = f.tell()
+
+        # --- index ---
+        entries = bytearray()
+        for offset, size in self._index:
+            entries += b"00dc" + self._u32(0x10) + self._u32(offset) + self._u32(size)
+        f.write(b"idx1" + self._u32(len(entries)) + bytes(entries))
+        file_end = f.tell()
+
+        # --- patch the sizes we could not know up front ---
+        f.seek(self._movi_size_pos)
+        f.write(self._u32(movi_end - self._movi_pos))
+        f.seek(self._avih_frames_pos)
+        f.write(self._u32(self.frames))
+        f.seek(self._strh_length_pos)
+        f.write(self._u32(self.frames))
+        f.seek(self._riff_size_pos)
+        f.write(self._u32(file_end - self._riff_size_pos - 4))
+
+        f.close()
+        self._file = None
 
 
 class ScopeStream:
@@ -247,10 +396,11 @@ class ScopeStream:
                 buf.extend(b"\x00" * (offset + len(payload) - len(buf)))
             buf[offset:offset + len(payload)] = payload
         try:
-            img = cv2.imdecode(np.frombuffer(bytes(buf), np.uint8), cv2.IMREAD_COLOR)
-        except cv2.error:
-            img = None
-        if img is None:
+            img = Image.open(BytesIO(bytes(buf)))
+            img.load()
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+        except Exception:
             return
         self.decode_ok += 1
         with self.lock:
@@ -533,6 +683,93 @@ class StatusBadge(tk.Canvas):
         self._redraw()
 
 
+class ThinScrollbar(tk.Canvas):
+    """A slim rounded scrollbar drawn entirely by us.
+
+    Tk's stock scrollbar is painted in the platform's own style, which shows up
+    as a pale grey bar against this dark interface on Windows. Drawing it here
+    keeps the panels looking the same everywhere.
+
+    It is a drop-in for tk.Scrollbar: pass `command=widget.xview` (or yview)
+    and register it with `widget.configure(xscrollcommand=bar.set)`.
+    """
+
+    def __init__(self, parent, orient="vertical", command=None,
+                 thickness=10, bg=None, **kw):
+        self._bg = bg or parent.cget("background")
+        horizontal = orient.startswith("h")
+        super().__init__(
+            parent, bd=0, highlightthickness=0, bg=self._bg, takefocus=0,
+            **({"height": thickness} if horizontal else {"width": thickness}), **kw
+        )
+        self._horizontal = horizontal
+        self._command = command
+        self._first = 0.0
+        self._last = 1.0
+        self._hover = False
+
+        self.bind("<Configure>", lambda _e: self._draw(), add="+")
+        self.bind("<ButtonPress-1>", self._on_drag, add="+")
+        self.bind("<B1-Motion>", self._on_drag, add="+")
+        self.bind("<Enter>", self._on_enter, add="+")
+        self.bind("<Leave>", self._on_leave, add="+")
+
+    # -- scrolled widget calls this -----------------------------------
+    def set(self, first, last):
+        self._first = max(0.0, min(1.0, float(first)))
+        self._last = max(0.0, min(1.0, float(last)))
+        self._draw()
+
+    def _on_enter(self, _e=None):
+        self._hover = True
+        self._draw()
+
+    def _on_leave(self, _e=None):
+        self._hover = False
+        self._draw()
+
+    def _on_drag(self, event):
+        if not callable(self._command):
+            return
+        length = self.winfo_width() if self._horizontal else self.winfo_height()
+        if length <= 1:
+            return
+        pos = event.x if self._horizontal else event.y
+        span = max(self._last - self._first, 0.0)
+        fraction = (pos / length) - span / 2.0
+        self._command("moveto", max(0.0, min(1.0 - span, fraction)))
+
+    def _draw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        # Nothing to scroll - draw nothing at all.
+        if self._first <= 0.0 and self._last >= 1.0:
+            return
+        radius = (h if self._horizontal else w) / 2.0
+        self.create_polygon(
+            rounded_points(0, 0, w, h, radius), smooth=True, splinesteps=12,
+            fill=SURFACE_2, outline="",
+        )
+        colour = TEAL if self._hover else SURFACE_3
+        if self._horizontal:
+            x1 = self._first * w
+            x2 = max(self._last * w, x1 + 18)
+            self.create_polygon(
+                rounded_points(x1, 1, min(x2, w), h - 1, radius),
+                smooth=True, splinesteps=12, fill=colour, outline="",
+            )
+        else:
+            y1 = self._first * h
+            y2 = max(self._last * h, y1 + 18)
+            self.create_polygon(
+                rounded_points(1, y1, w - 1, min(y2, h), radius),
+                smooth=True, splinesteps=12, fill=colour, outline="",
+            )
+
+
 # ==========================================================================
 # MAIN APPLICATION
 # ==========================================================================
@@ -758,8 +995,47 @@ class CameraApp:
                                  bg=BG, autosize=True)
         deck_card.pack(fill="x")
         deck = deck_card.body
-        inner = tk.Frame(deck, bg=SURFACE)
-        inner.pack(fill="x", padx=18, pady=14)
+
+        # The command bar is one scrollable row. On a narrow window or a
+        # smaller screen the sections would otherwise be cut off at the right
+        # edge, so the row scrolls sideways and the scrollbar appears only
+        # when the buttons actually overflow.
+        holder = tk.Frame(deck, bg=SURFACE)
+        holder.pack(fill="x", padx=16, pady=(12, 10))
+
+        canvas = tk.Canvas(holder, bg=SURFACE, bd=0, highlightthickness=0)
+        canvas.pack(side="top", fill="x")
+
+        hbar = ThinScrollbar(holder, orient="horizontal", command=canvas.xview,
+                             thickness=10, bg=SURFACE)
+        canvas.configure(xscrollcommand=hbar.set)
+
+        inner = tk.Frame(canvas, bg=SURFACE)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _deck_resize(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            wanted = inner.winfo_reqheight()
+            if wanted > 1 and abs(canvas.winfo_height() - wanted) > 1:
+                canvas.configure(height=wanted)
+            overflowing = inner.winfo_reqwidth() > canvas.winfo_width() + 1
+            if overflowing and not hbar.winfo_ismapped():
+                hbar.pack(side="top", fill="x", pady=(8, 0))
+            elif not overflowing and hbar.winfo_ismapped():
+                hbar.pack_forget()
+                canvas.xview_moveto(0)
+
+        inner.bind("<Configure>", _deck_resize, add="+")
+        canvas.bind("<Configure>", _deck_resize, add="+")
+
+        def _deck_wheel(event):
+            if inner.winfo_reqwidth() <= canvas.winfo_width():
+                return
+            step = -1 if getattr(event, "delta", 0) > 0 or event.num == 4 else 1
+            canvas.xview_scroll(step, "units")
+
+        for seq in ("<MouseWheel>", "<Shift-MouseWheel>", "<Button-4>", "<Button-5>"):
+            canvas.bind(seq, _deck_wheel, add="+")
 
         # -- CAPTURE ------------------------------------------------------
         cap = tk.Frame(inner, bg=SURFACE)
@@ -815,20 +1091,22 @@ class CameraApp:
                     command=lambda: self.open_folder(str(VIDEO_DIR)),
                     bg=SURFACE).pack(side="left")
 
-        # -- connection button on the right of the deck --------------------
+        self._deck_divider(inner)
+
+        # -- CONNECTION ----------------------------------------------------
         conn = tk.Frame(inner, bg=SURFACE)
-        conn.pack(side="right", fill="y")
-        self._section_title(conn, "CONNECTION", anchor="e")
+        conn.pack(side="left", fill="y")
+        self._section_title(conn, "CONNECTION")
         conn_row = tk.Frame(conn, bg=SURFACE)
-        conn_row.pack(anchor="e", pady=(8, 0))
+        conn_row.pack(anchor="w", pady=(8, 0))
         self.deck_connect_button = RoundButton(conn_row, text="Connect",
                                                kind="primary",
                                                command=self.toggle_connection,
                                                bg=SURFACE)
-        self.deck_connect_button.pack(side="right")
+        self.deck_connect_button.pack(side="left")
 
     def _deck_divider(self, parent):
-        tk.Frame(parent, bg=LINE, width=1).pack(side="left", fill="y", padx=20, pady=4)
+        tk.Frame(parent, bg=LINE, width=1).pack(side="left", fill="y", padx=16, pady=4)
 
     def _section_title(self, parent, text, anchor="w"):
         self._label(parent, text.upper(), size=8, weight="bold",
@@ -870,14 +1148,12 @@ class CameraApp:
         canvas = tk.Canvas(wrap, bg=SURFACE, bd=0, highlightthickness=0)
         canvas.grid(row=0, column=0, sticky="nsew")
 
-        bar_style = dict(bg=SURFACE_3, troughcolor=SURFACE_2, activebackground=TEAL,
-                         bd=0, relief="flat", highlightthickness=0)
-        vbar = tk.Scrollbar(wrap, orient="vertical", command=canvas.yview,
-                            width=12, **bar_style)
-        vbar.grid(row=0, column=1, sticky="ns", padx=(4, 0))
-        hbar = tk.Scrollbar(wrap, orient="horizontal", command=canvas.xview,
-                            width=12, **bar_style)
-        hbar.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        vbar = ThinScrollbar(wrap, orient="vertical", command=canvas.yview,
+                             thickness=10, bg=SURFACE)
+        vbar.grid(row=0, column=1, sticky="ns", padx=(5, 0))
+        hbar = ThinScrollbar(wrap, orient="horizontal", command=canvas.xview,
+                             thickness=10, bg=SURFACE)
+        hbar.grid(row=1, column=0, sticky="ew", pady=(5, 0))
         canvas.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
 
         inner = tk.Frame(canvas, bg=SURFACE)
@@ -1251,98 +1527,135 @@ class CameraApp:
     # ------------------------------------------------------------------
     # IMAGE PIPELINE
     # ------------------------------------------------------------------
+    _GAMMA_CACHE = {}
+
+    @staticmethod
+    def _gamma_table(gamma_percent):
+        """256-entry lookup table for a gamma value, built once per setting."""
+        table = CameraApp._GAMMA_CACHE.get(gamma_percent)
+        if table is None:
+            g = max(gamma_percent, 1) / 100.0
+            single = [min(255, int(((i / 255.0) ** (1.0 / g)) * 255 + 0.5))
+                      for i in range(256)]
+            table = single * 3          # one band each for R, G and B
+            CameraApp._GAMMA_CACHE[gamma_percent] = table
+        return table
+
+    def _overlay_font(self, size):
+        cached = getattr(self, "_font_cache", None)
+        if cached is None:
+            cached = self._font_cache = {}
+        font_obj = cached.get(size)
+        if font_obj is None:
+            for name in ("segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"):
+                try:
+                    font_obj = ImageFont.truetype(name, size)
+                    break
+                except OSError:
+                    continue
+            if font_obj is None:
+                font_obj = ImageFont.load_default()
+            cached[size] = font_obj
+        return font_obj
+
     def process_frame(self, frame, include_overlays=True):
+        """Apply every transform, adjustment and overlay to one frame.
+
+        Works on Pillow images throughout. The controls map directly onto
+        Pillow's enhancement operations, which keeps the application small and
+        quick to start - the whole OpenCV/NumPy stack is no longer needed.
+        """
         if frame is None:
             return None
         out = frame
 
         if self.flip_h.get():
-            out = cv2.flip(out, 1)
+            out = out.transpose(Image.FLIP_LEFT_RIGHT)
         if self.flip_v.get():
-            out = cv2.flip(out, 0)
+            out = out.transpose(Image.FLIP_TOP_BOTTOM)
 
         rot = self.rotate_var.get()
         if rot == "90":
-            out = cv2.rotate(out, cv2.ROTATE_90_CLOCKWISE)
+            out = out.transpose(Image.ROTATE_270)      # clockwise
         elif rot == "180":
-            out = cv2.rotate(out, cv2.ROTATE_180)
+            out = out.transpose(Image.ROTATE_180)
         elif rot == "270":
-            out = cv2.rotate(out, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            out = out.transpose(Image.ROTATE_90)       # anticlockwise
+
+        # From here on we own the pixels, so operations may work in place.
+        if out is frame:
+            out = out.copy()
+
+        contrast = self.contrast_var.get()
+        if contrast:
+            out = ImageEnhance.Contrast(out).enhance(1.0 + contrast / 100.0)
 
         brightness = self.brightness_var.get()
-        contrast = self.contrast_var.get()
-        if brightness or contrast:
-            alpha = 1.0 + contrast / 100.0
-            out = cv2.convertScaleAbs(out, alpha=alpha, beta=float(brightness))
+        if brightness:
+            out = ImageEnhance.Brightness(out).enhance(1.0 + brightness / 100.0)
 
         sat = self.saturation_var.get()
         if sat != 100:
-            hsv = cv2.cvtColor(out, cv2.COLOR_BGR2HSV).astype(np.float32)
-            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (sat / 100.0), 0, 255)
-            out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+            out = ImageEnhance.Color(out).enhance(sat / 100.0)
 
         gamma = self.gamma_var.get()
         if gamma != 100:
-            g = max(gamma, 1) / 100.0
-            table = np.array([((i / 255.0) ** (1.0 / g)) * 255
-                              for i in range(256)]).astype(np.uint8)
-            out = cv2.LUT(out, table)
+            out = out.point(self._gamma_table(gamma))
 
         denoise = self.denoise_var.get()
         if denoise > 0:
-            d = int(3 + denoise / 20)
-            out = cv2.bilateralFilter(out, d, denoise, denoise)
+            out = out.filter(ImageFilter.GaussianBlur(radius=denoise / 70.0))
 
         sharp = self.sharpness_var.get()
         if sharp > 0:
-            blur = cv2.GaussianBlur(out, (0, 0), sigmaX=1.2)
-            out = cv2.addWeighted(out, 1 + sharp / 100.0, blur, -sharp / 100.0, 0)
+            out = ImageEnhance.Sharpness(out).enhance(1.0 + sharp / 40.0)
 
-        if include_overlays:
-            h, w = out.shape[:2]
-            overlay_color = (200, 230, 235)
+        if include_overlays and (self.grid_var.get() or self.crosshair_var.get()
+                                 or self.timestamp_var.get()):
+            w, h = out.size
+            draw = ImageDraw.Draw(out)
+            colour = (200, 230, 235)
             if self.grid_var.get():
                 for i in (1, 2):
-                    cv2.line(out, (w * i // 3, 0), (w * i // 3, h),
-                             overlay_color, 1, cv2.LINE_AA)
-                    cv2.line(out, (0, h * i // 3), (w, h * i // 3),
-                             overlay_color, 1, cv2.LINE_AA)
+                    draw.line([(w * i // 3, 0), (w * i // 3, h)], fill=colour, width=1)
+                    draw.line([(0, h * i // 3), (w, h * i // 3)], fill=colour, width=1)
             if self.crosshair_var.get():
                 cx, cy = w // 2, h // 2
-                cv2.line(out, (cx - 26, cy), (cx + 26, cy), overlay_color, 1, cv2.LINE_AA)
-                cv2.line(out, (cx, cy - 26), (cx, cy + 26), overlay_color, 1, cv2.LINE_AA)
-                cv2.rectangle(out, (cx - 26, cy - 26), (cx + 26, cy + 26),
-                              overlay_color, 1, cv2.LINE_AA)
+                draw.line([(cx - 26, cy), (cx + 26, cy)], fill=colour, width=1)
+                draw.line([(cx, cy - 26), (cx, cy + 26)], fill=colour, width=1)
+                draw.rectangle([cx - 26, cy - 26, cx + 26, cy + 26],
+                               outline=colour, width=1)
             if self.timestamp_var.get():
                 stamp = datetime.now().strftime("%d %b %Y  %H:%M:%S")
-                cv2.putText(out, stamp, (14, h - 16), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.55, (0, 0, 0), 3, cv2.LINE_AA)
-                cv2.putText(out, stamp, (14, h - 16), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.55, (255, 255, 255), 1, cv2.LINE_AA)
+                font_obj = self._overlay_font(max(14, int(h * 0.04)))
+                draw.text((14, h - 14), stamp, font=font_obj, anchor="ls",
+                          fill=(255, 255, 255),
+                          stroke_width=2, stroke_fill=(0, 0, 0))
         return out
 
     def _render_fit(self, frame, cw, ch):
-        """Scale `frame` into a cw x ch canvas honouring zoom and pan."""
-        h, w = frame.shape[:2]
+        """Scale `frame` into a cw x ch letterboxed canvas, honouring zoom/pan."""
+        w, h = frame.size
         if w == 0 or h == 0 or cw <= 1 or ch <= 1:
             return None
         scale = min(cw / w, ch / h) * self.zoom
         nw, nh = max(int(w * scale), 1), max(int(h * scale), 1)
-        interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-        resized = cv2.resize(frame, (nw, nh), interpolation=interp)
-
-        canvas = np.zeros((ch, cw, 3), dtype=np.uint8)
-        canvas[:] = (10, 8, 3)
+        resample = Image.BILINEAR if scale >= 1 else Image.LANCZOS
+        resized = frame.resize((nw, nh), resample)
 
         ox = (cw - nw) // 2 + int(self.pan_x)
         oy = (ch - nh) // 2 + int(self.pan_y)
+
+        # Crop away anything that falls outside the viewport before pasting,
+        # so panning never tries to write past the canvas edges.
         sx0, sy0 = max(0, -ox), max(0, -oy)
-        dx0, dy0 = max(0, ox), max(0, oy)
-        cw_copy = min(nw - sx0, cw - dx0)
-        ch_copy = min(nh - sy0, ch - dy0)
-        if cw_copy > 0 and ch_copy > 0:
-            canvas[dy0:dy0 + ch_copy, dx0:dx0 + cw_copy] = \
-                resized[sy0:sy0 + ch_copy, sx0:sx0 + cw_copy]
+        vis_w = min(nw - sx0, cw - max(0, ox))
+        vis_h = min(nh - sy0, ch - max(0, oy))
+
+        canvas = Image.new("RGB", (cw, ch), (3, 8, 10))
+        if vis_w > 0 and vis_h > 0:
+            piece = resized.crop((sx0, sy0, sx0 + vis_w, sy0 + vis_h))
+            canvas.paste(piece, (max(0, ox), max(0, oy)))
         return canvas
 
     def render(self):
@@ -1373,8 +1686,7 @@ class CameraApp:
         fitted = self._render_fit(processed, cw, ch)
         if fitted is None:
             return
-        rgb = cv2.cvtColor(fitted, cv2.COLOR_BGR2RGB)
-        photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        photo = ImageTk.PhotoImage(fitted)
 
         canvas.delete("video")
         canvas.create_image(0, 0, image=photo, anchor="nw", tags="video")
@@ -1396,8 +1708,7 @@ class CameraApp:
             out_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             path = out_dir / f"CARE_ENT_Scope_{stamp}.jpg"
-            if not cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95]):
-                raise RuntimeError("JPEG save failed")
+            frame.save(str(path), "JPEG", quality=95, subsampling=0)
             self.status_label.configure(text=f"Snapshot saved: {path.name}")
         except Exception:
             messagebox.showwarning(APP_NAME, "Could not save snapshot.")
@@ -1413,23 +1724,19 @@ class CameraApp:
             messagebox.showwarning("Video Recording", "No camera frame is available yet.")
             return
         frame = self.process_frame(self.last_frame, include_overlays=True)
-        h, w = frame.shape[:2]
+        w, h = frame.size
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fps = max(self.display_fps, 12.0)
+        fps = int(round(max(min(self.display_fps, 30.0), 10.0)))
 
-        for fourcc_name, suffix in (("mp4v", ".mp4"), ("MJPG", ".avi")):
-            path = VIDEO_DIR / f"CARE_ENT_Scope_{stamp}{suffix}"
-            writer = cv2.VideoWriter(str(path),
-                                     cv2.VideoWriter_fourcc(*fourcc_name),
-                                     fps, (w, h))
-            if writer.isOpened():
-                self.writer = writer
-                self.record_path = path
-                break
-            writer.release()
-        else:
+        path = VIDEO_DIR / f"CARE_ENT_Scope_{stamp}.avi"
+        try:
+            VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+            self.writer = MjpegAviWriter(path, w, h, fps)
+            self.record_path = path
+        except Exception as exc:
+            self.writer = None
             messagebox.showwarning("Video Recording",
-                                   "No compatible video encoder is available.")
+                                   f"Could not start recording.\n\n{exc}")
             return
 
         self.recording = True
@@ -1445,7 +1752,7 @@ class CameraApp:
         self.recording = False
         if self.writer is not None:
             try:
-                self.writer.release()
+                self.writer.close()
             except Exception:
                 pass
         self.writer = None

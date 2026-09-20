@@ -1,3 +1,9 @@
-opencv-python>=4.9,<5.0
-numpy>=1.26
-pillow>=10.0
+# CARE ENT Scope Camera v3.0.0 needs only Pillow.
+#
+# v2 depended on OpenCV and NumPy, which accounted for roughly 107 MB and
+# 55 MB of the installed footprint and made the program a 66 MB download.
+# Everything the app actually did with them - JPEG decode, resize, the image
+# adjustments, the overlays and video recording - is done with Pillow and a
+# small built-in MJPEG/AVI writer instead, so the application is now about
+# 18 MB and starts noticeably faster.
+pillow>=10.0,<12
