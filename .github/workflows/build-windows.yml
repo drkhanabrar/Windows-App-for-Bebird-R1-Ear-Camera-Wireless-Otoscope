@@ -1,34 +1,54 @@
-name: Build CARE ENT Scope Camera
+name: Build Windows EXE
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ main, master ]
+    paths:
+      - 'windows/**'
+      - '.github/workflows/windows.yml'
   workflow_dispatch:
+  release:
+    types: [ created ]
 
 jobs:
-  build-windows:
+  build:
+    name: PyInstaller build
     runs-on: windows-latest
+
     steps:
-      - name: Checkout
+      - name: Check out the repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install pyinstaller
+          pip install -r windows/requirements.txt
+          pip install pyinstaller
 
-      - name: Build EXE
-        shell: cmd
-        run: build_windows.bat
+      - name: Build single-file EXE
+        run: >
+          pyinstaller
+          --noconfirm
+          --onefile
+          --windowed
+          --name CARE_ENT_Scope_Camera
+          windows/care_ent_scope_camera.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
           name: CARE-ENT-Scope-Camera-Windows
-          path: dist/CARE ENT Scope Camera.exe
+          path: dist/CARE_ENT_Scope_Camera.exe
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach EXE to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/CARE_ENT_Scope_Camera.exe
