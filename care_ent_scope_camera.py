@@ -1,3 +1,39 @@
+"""
+CARE ENT Scope Camera - Professional Windows camera workstation
+================================================================
+
+Wi-Fi ENT endoscope (Bebird-type) live viewer, capture and recording workstation.
+
+Developed by Dr. Abrar Khan - Care Hospital, Chikhli
+(c) 2026 Care Hospital. All rights reserved.
+
+--------------------------------------------------------------------------
+VERSION 3.0.0 - what changed from 2.0.0
+--------------------------------------------------------------------------
+FIX 1  Buttons no longer flicker on hover.
+       The old buttons were a Frame with a Label inside it. Moving the mouse
+       from the Frame onto its child Label fires <Leave> then <Enter> over and
+       over, so the button repainted continuously. Every button is now a single
+       Canvas widget with no child widgets, so there is nothing to cross into
+       and hover is one clean colour change (see class RoundButton).
+
+FIX 2  The "Connect Camera" button disappears once video starts.
+       The welcome overlay is now bound to one rule: it is on screen only while
+       there is no picture (self.last_frame is None). The first decoded frame
+       hides it, disconnecting brings it back. See _sync_overlay().
+
+FIX 3  Full Screen shows only the video, not the whole application.
+       F11 / the Full Screen button now opens a separate black window that
+       contains nothing but the video canvas, and the render loop draws into
+       that window while it is open. Esc, F11 or a double-click closes it.
+       See open_video_fullscreen() / close_video_fullscreen().
+
+FIX 4  Professional, elegant look with rounded buttons.
+       Rounded pill buttons, rounded panels, rounded status badges, a refined
+       clinical palette and Segoe UI typography throughout.
+--------------------------------------------------------------------------
+"""
+
 import os
 import sys
 import time
@@ -7,44 +43,78 @@ import threading
 import subprocess
 from pathlib import Path
 from datetime import datetime
+
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, font as tkfont
 
 import numpy as np
 import cv2
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk
+
+# ==========================================================================
+# APPLICATION CONSTANTS
+# ==========================================================================
 
 APP_NAME = "CARE ENT Scope Camera"
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
+APP_VENDOR = "Care Hospital, Chikhli"
+APP_AUTHOR = "Dr. Abrar Khan"
+APP_PHONE = "+91 9370111449"
+APP_WEB = "www.carehospital.in"
+
+# --- Wi-Fi scope stream protocol (Bebird-type UDP/JPEG) -------------------
 CAMERA_IP_DEFAULT = "192.168.10.123"
 CAMERA_PORT_DEFAULT = 8030
-HDR = 51
-STRIDE = 1388
-TYPE_VIDEO = 3
+HDR = 51            # bytes of packet header before the JPEG payload
+STRIDE = 1388       # payload bytes per chunk index
+TYPE_VIDEO = 3      # packet type id for video payload
+KEEPALIVE_PERIOD = 0.4
+RECV_BUFFER = 4 * 1024 * 1024
 
-BASE_DIR = Path.home() / "Documents" / "CARE ENT Scope"
+# --- Local storage --------------------------------------------------------
+home = Path.home()
+BASE_DIR = home / "Documents" / "CARE ENT Scope"
 CAPTURE_DIR = BASE_DIR / "Captures"
 VIDEO_DIR = BASE_DIR / "Videos"
-for folder in (CAPTURE_DIR, VIDEO_DIR):
+for folder in (BASE_DIR, CAPTURE_DIR, VIDEO_DIR):
     folder.mkdir(parents=True, exist_ok=True)
 
-BG = "#07161C"
-SURFACE = "#0B2028"
-SURFACE_2 = "#102A33"
-SURFACE_3 = "#14343D"
-LINE = "#1C4049"
-TEXT = "#EFFBFD"
-MUTED = "#7EA5AD"
-TEAL = "#35C4B8"
-TEAL_DARK = "#1B7774"
-TEAL_SOFT = "#163F43"
-RED = "#E25B6B"
-AMBER = "#E2B455"
-GREEN = "#57D4A8"
-BLACK = "#03090C"
+# ==========================================================================
+# PALETTE  (refined clinical dark theme)
+# ==========================================================================
 
+BG = "#081216"          # window background
+SURFACE = "#0E1F26"     # panels / cards
+SURFACE_2 = "#142C35"   # inputs, raised surfaces
+SURFACE_3 = "#1B3C47"   # hover surfaces
+LINE = "#23464F"        # hairline borders
+TEXT = "#EDF8FA"        # primary text
+MUTED = "#89A9B1"       # secondary text
+DIM = "#5E7E85"         # tertiary text
+TEAL = "#2FC7B7"        # accent
+TEAL_DARK = "#17837C"   # accent pressed
+TEAL_SOFT = "#0D3136"   # accent tinted surface
+RED = "#E2596A"
+RED_DARK = "#8E2E3C"
+AMBER = "#E3B457"
+GREEN = "#4FD3A4"
+BLACK = "#03080A"
+
+FONT_FAMILY = "Segoe UI"
+FONT_MONO = "Consolas"
+
+
+def font(size=10, weight="normal"):
+    """Return a font tuple, preferring Segoe UI on Windows."""
+    return (FONT_FAMILY, size, weight)
+
+
+# ==========================================================================
+# STREAM RECEIVER  (unchanged protocol - verified against the original build)
+# ==========================================================================
 
 def start_packet():
+    """24-byte START command: magic 0x9999 (LE u16) at 0, opcode 1 at byte 2."""
     b = bytearray(24)
     struct.pack_into("<H", b, 0, 0x9999)
     b[2] = 1
@@ -52,6 +122,7 @@ def start_packet():
 
 
 def stop_packet():
+    """24-byte STOP command: magic 0x9999 (LE u16) at 0, opcode 2 at byte 2."""
     b = bytearray(24)
     struct.pack_into("<H", b, 0, 0x9999)
     b[2] = 2
@@ -63,59 +134,107 @@ STOP = stop_packet()
 
 
 class ScopeStream:
-    """Bebird-type UDP/JPEG stream receiver based on the supplied verified protocol."""
-    def __init__(self, ip: str, port: int):
+    """Bebird-type UDP/JPEG stream receiver.
+
+    The scope sends each JPEG frame as a series of UDP packets. Every packet
+    carries a 51-byte header; byte offset 2 holds the packet type and offset 33
+    holds the 1-based chunk index. Chunk 1 begins with the JPEG SOI marker
+    (FF D8); each chunk occupies STRIDE bytes at (index - 1) * STRIDE in the
+    reassembled frame buffer.
+    """
+
+    def __init__(self, ip, port):
         self.ip = ip
         self.port = int(port)
         self.sock = None
         self.running = False
         self.latest = None
+        self.latest_id = 0
         self.lock = threading.Lock()
         self.last_frame_time = 0.0
         self.pkt_count = 0
         self.frame_count = 0
         self.decode_ok = 0
         self.last_len = 0
-        self.latest_id = 0
         self.error_text = ""
 
+    # -- lifecycle ---------------------------------------------------------
     def start(self):
         if self.running:
             return
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-        except OSError:
-            pass
-        self.sock.bind(("", 0))
-        self.sock.settimeout(1.0)
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUFFER)
+            except OSError:
+                pass
+            self.sock.bind(("", 0))
+            self.sock.settimeout(1.0)
+        except OSError as exc:
+            self.error_text = str(exc)
+            return
         self.running = True
         threading.Thread(target=self._keepalive, daemon=True).start()
         threading.Thread(target=self._recv, daemon=True).start()
 
     def stop(self):
         self.running = False
-        sock = self.sock
+        if self.sock:
+            try:
+                self.sock.sendto(STOP, (self.ip, self.port))
+            except OSError:
+                pass
+            try:
+                self.sock.close()
+            except OSError:
+                pass
         self.sock = None
-        if sock:
-            try:
-                sock.sendto(STOP, (self.ip, self.port))
-            except OSError:
-                pass
-            try:
-                sock.close()
-            except OSError:
-                pass
 
+    # -- worker threads ----------------------------------------------------
     def _keepalive(self):
         while self.running:
-            try:
-                if self.sock:
+            if self.sock:
+                try:
                     self.sock.sendto(START, (self.ip, self.port))
-            except OSError as exc:
+                except OSError as exc:
+                    self.error_text = str(exc)
+            time.sleep(KEEPALIVE_PERIOD)
+
+    def _recv(self):
+        chunks = {}
+        collecting = False
+        while self.running:
+            try:
+                data, _ = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception as exc:
                 self.error_text = str(exc)
-            time.sleep(0.4)
+                break
+
+            self.pkt_count += 1
+            self.last_len = len(data)
+            if len(data) < HDR:
+                continue
+            if struct.unpack_from("<H", data, 2)[0] != TYPE_VIDEO:
+                continue
+
+            idx = struct.unpack_from("<H", data, 33)[0]
+            payload = data[HDR:]
+            if idx <= 0:
+                continue
+
+            if idx == 1 and payload[:2] == b"\xff\xd8":
+                if collecting:
+                    self._emit(chunks)
+                chunks = {1: payload}
+                collecting = True
+                self.frame_count += 1
+            elif collecting:
+                chunks[idx] = payload
 
     def _emit(self, chunks):
         if not chunks:
@@ -131,871 +250,1431 @@ class ScopeStream:
             img = cv2.imdecode(np.frombuffer(bytes(buf), np.uint8), cv2.IMREAD_COLOR)
         except cv2.error:
             img = None
-        if img is not None:
-            self.decode_ok += 1
-            with self.lock:
-                self.latest = img
-                self.latest_id += 1
-                self.last_frame_time = time.time()
-
-    def _recv(self):
-        chunks = {}
-        collecting = False
-        while self.running:
-            try:
-                data, _ = self.sock.recvfrom(65535)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            except Exception as exc:
-                self.error_text = str(exc)
-                break
-            self.pkt_count += 1
-            self.last_len = len(data)
-            if len(data) < HDR:
-                continue
-            if struct.unpack_from("<H", data, 2)[0] != TYPE_VIDEO:
-                continue
-            idx = struct.unpack_from("<H", data, 33)[0]
-            payload = data[HDR:]
-            if idx <= 0:
-                continue
-            if idx == 1 and payload[:2] == b"\xff\xd8":
-                if collecting:
-                    self._emit(chunks)
-                chunks = {1: payload}
-                collecting = True
-                self.frame_count += 1
-            elif collecting:
-                chunks[idx] = payload
+        if img is None:
+            return
+        self.decode_ok += 1
+        with self.lock:
+            self.latest = img
+            self.latest_id += 1
+            self.last_frame_time = time.time()
 
     def get_frame(self):
         with self.lock:
             if self.latest is None:
-                return None, self.latest_id
+                return None, 0
             return self.latest.copy(), self.latest_id
 
 
-class ModernButton(tk.Frame):
-    def __init__(self, parent, text, command=None, width=None, height=38, kind="secondary", icon=None):
-        bg = SURFACE_3 if kind == "secondary" else (TEAL_DARK if kind == "primary" else "#5D2530")
-        hover = "#1A444D" if kind == "secondary" else ("#2A8F89" if kind == "primary" else "#7A2F3D")
-        fg = TEXT
-        super().__init__(parent, bg=bg, highlightthickness=1, highlightbackground=LINE)
-        self._bg = bg
-        self._hover = hover
+# ==========================================================================
+# ROUNDED UI PRIMITIVES
+# ==========================================================================
+
+def rounded_points(x1, y1, x2, y2, r):
+    """Point list for a smooth-splined rounded rectangle."""
+    r = max(0.0, min(r, (x2 - x1) / 2.0, (y2 - y1) / 2.0))
+    return [
+        x1 + r, y1,
+        x2 - r, y1, x2, y1,
+        x2, y1 + r,
+        x2, y2 - r, x2, y2,
+        x2 - r, y2,
+        x1 + r, y2, x1, y2,
+        x1, y2 - r,
+        x1, y1 + r, x1, y1,
+    ]
+
+
+class RoundButton(tk.Canvas):
+    """A rounded pill button drawn on a single Canvas.
+
+    FIX 1 - NO HOVER FLICKER.
+    The previous implementation nested a Label inside a Frame. Tk delivers a
+    <Leave> to the Frame the moment the pointer crosses onto the child Label,
+    immediately followed by an <Enter>, which made the button repaint in a
+    loop and read as flicker. This widget has no children at all: the shape
+    and the caption are Canvas *items*, which never generate crossing events.
+    Hover therefore fires exactly once and only recolours existing items -
+    no widget is created, resized or re-packed.
+    """
+
+    STYLES = {
+        # kind:       (fill,      hover,      active,     text,   border)
+        "primary":   (TEAL,       "#45D8C8",  TEAL_DARK,  "#04191B", ""),
+        "secondary": (SURFACE_2,  SURFACE_3,  "#0E242B",  TEXT,     LINE),
+        "ghost":     ("",         SURFACE_2,  SURFACE_3,  MUTED,    ""),
+        "danger":    (RED,        "#EC6D7D",  RED_DARK,   "#1A0508", ""),
+        "success":   (GREEN,      "#68E0B6",  "#2C8F70",  "#03110C", ""),
+    }
+
+    def __init__(self, parent, text="", command=None, kind="secondary",
+                 width=None, height=38, radius=None, font_size=10,
+                 font_weight="bold", padding=22, bg=None, **kw):
+        self._parent_bg = bg or parent.cget("background")
+        super().__init__(parent, height=height, bd=0, highlightthickness=0,
+                         bg=self._parent_bg, takefocus=0, **kw)
+
+        self._text = text
         self._command = command
+        self._kind = kind if kind in self.STYLES else "secondary"
+        self._height = height
+        self._radius = radius if radius is not None else height / 2.0
+        self._font = font(font_size, font_weight)
+        self._padding = padding
+        self._enabled = True
+        self._state = "normal"          # normal | hover | active
+        self._shape = None
+        self._caption = None
+
+        if width is None:
+            measure = tkfont.Font(font=self._font)
+            width = measure.measure(text) + padding * 2
+        self.configure(width=max(int(width), height))
+
+        self.bind("<Configure>", self._redraw, add="+")
+        self.bind("<Enter>", self._on_enter, add="+")
+        self.bind("<Leave>", self._on_leave, add="+")
+        self.bind("<ButtonPress-1>", self._on_press, add="+")
+        self.bind("<ButtonRelease-1>", self._on_release, add="+")
         self.configure(cursor="hand2")
-        if width:
-            self.configure(width=width)
-            self.pack_propagate(False)
-        self.configure(height=height)
 
-        self.label = tk.Label(self, text=((icon + "  ") if icon else "") + text, bg=bg, fg=fg,
-                              font=("Arial", 10, "bold"), cursor="hand2")
-        self.label.pack(fill="both", expand=True, padx=10)
-        for w in (self, self.label):
-            w.bind("<Enter>", self._on_enter)
-            w.bind("<Leave>", self._on_leave)
-            w.bind("<Button-1>", self._on_click)
+    # -- painting ----------------------------------------------------------
+    def _colors(self):
+        fill, hover, active, fg, border = self.STYLES[self._kind]
+        if not self._enabled:
+            return SURFACE_2, DIM, LINE
+        if self._state == "active":
+            return (active or fill), fg, border
+        if self._state == "hover":
+            return (hover or fill), fg, border
+        return fill, fg, border
 
-    def _on_enter(self, _event):
-        self.configure(bg=self._hover)
-        self.label.configure(bg=self._hover)
+    def _redraw(self, _event=None):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        fill, fg, border = self._colors()
+        pts = rounded_points(1, 1, w - 1, h - 1, self._radius)
+        self._shape = self.create_polygon(
+            pts, smooth=True, splinesteps=24,
+            fill=(fill if fill else self._parent_bg),
+            outline=(border if border else (fill if fill else self._parent_bg)),
+            width=1,
+        )
+        self._caption = self.create_text(
+            w / 2, h / 2 + 1, text=self._text, fill=fg,
+            font=self._font, anchor="center",
+        )
 
-    def _on_leave(self, _event):
-        self.configure(bg=self._bg)
-        self.label.configure(bg=self._bg)
+    def _repaint(self):
+        """Recolour existing items only - cheapest possible hover update."""
+        if self._shape is None:
+            self._redraw()
+            return
+        fill, fg, border = self._colors()
+        self.itemconfigure(
+            self._shape,
+            fill=(fill if fill else self._parent_bg),
+            outline=(border if border else (fill if fill else self._parent_bg)),
+        )
+        self.itemconfigure(self._caption, fill=fg)
 
-    def _on_click(self, _event):
-        if self._command:
+    # -- events ------------------------------------------------------------
+    def _on_enter(self, _e=None):
+        if not self._enabled or self._state == "hover":
+            return
+        self._state = "hover"
+        self._repaint()
+
+    def _on_leave(self, _e=None):
+        if self._state == "normal":
+            return
+        self._state = "normal"
+        self._repaint()
+
+    def _on_press(self, _e=None):
+        if not self._enabled:
+            return
+        self._state = "active"
+        self._repaint()
+
+    def _on_release(self, event=None):
+        if not self._enabled:
+            return
+        inside = (
+            event is not None
+            and 0 <= event.x <= self.winfo_width()
+            and 0 <= event.y <= self.winfo_height()
+        )
+        self._state = "hover" if inside else "normal"
+        self._repaint()
+        if inside and callable(self._command):
             self._command()
 
-    def set(self, text, kind=None):
-        if kind:
-            self._bg = SURFACE_3 if kind == "secondary" else (TEAL_DARK if kind == "primary" else "#5D2530")
-            self._hover = "#1A444D" if kind == "secondary" else ("#2A8F89" if kind == "primary" else "#7A2F3D")
-        self.label.configure(text=text, bg=self._bg)
-        self.configure(bg=self._bg)
+    # -- public API --------------------------------------------------------
+    def set_text(self, text, autosize=True):
+        if text == self._text:
+            return
+        self._text = text
+        if autosize:
+            measure = tkfont.Font(font=self._font)
+            self.configure(width=max(
+                measure.measure(text) + self._padding * 2, self._height))
+        if self._caption is not None:
+            self.itemconfigure(self._caption, text=text)
+        else:
+            self._redraw()
+
+    def set_kind(self, kind):
+        if kind not in self.STYLES or kind == self._kind:
+            return
+        self._kind = kind
+        self._repaint()
+
+    def set_enabled(self, enabled):
+        if enabled == self._enabled:
+            return
+        self._enabled = bool(enabled)
+        self.configure(cursor="hand2" if self._enabled else "arrow")
+        self._state = "normal"
+        self._repaint()
+
+    def set_command(self, command):
+        self._command = command
 
 
-class CameraApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title(APP_NAME)
-        self.configure(bg=BG)
-        self.minsize(1040, 650)
+class RoundedPanel(tk.Frame):
+    """A container with rounded corners.
+
+    A Canvas paints the rounded card; `panel.body` is an ordinary Frame placed
+    inside it and is what callers put widgets into.
+    """
+
+    def __init__(self, parent, radius=16, fill=SURFACE, border=LINE,
+                 pad=1, bg=None, autosize=False, **kw):
+        outer_bg = bg or parent.cget("background")
+        super().__init__(parent, bg=outer_bg, bd=0, highlightthickness=0, **kw)
+        self._radius = radius
+        self._fill = fill
+        self._border = border
+        self._outer_bg = outer_bg
+        self._pad = pad
+        self._autosize = autosize
+
+        self._canvas = tk.Canvas(self, bd=0, highlightthickness=0, bg=outer_bg)
+        self._canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        self.body = tk.Frame(self, bg=fill, bd=0, highlightthickness=0)
+        self.body.place(relx=0, rely=0, relwidth=1, relheight=1,
+                        x=pad, y=pad, width=-2 * pad, height=-2 * pad)
+
+        self.bind("<Configure>", self._redraw, add="+")
+
+        # `body` is placed, not packed, so this frame has no natural size of its
+        # own. Panels that must hug their content (the command deck) ask for
+        # autosize and take their height from the body's requested height.
+        if autosize:
+            self.body.bind("<Configure>", self._autofit, add="+")
+            self.after_idle(self._autofit)
+
+    def _autofit(self, _event=None):
+        if not self._autosize:
+            return
+        wanted = self.body.winfo_reqheight() + 2 * self._pad
+        if wanted > 2 and abs(wanted - self.winfo_height()) > 1:
+            self.configure(height=wanted)
+
+    def _redraw(self, _event=None):
+        self._canvas.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        self._canvas.create_polygon(
+            rounded_points(0.5, 0.5, w - 0.5, h - 0.5, self._radius),
+            smooth=True, splinesteps=24,
+            fill=self._fill, outline=self._border, width=1,
+        )
+
+
+class StatusBadge(tk.Canvas):
+    """Rounded status pill with a coloured indicator dot."""
+
+    def __init__(self, parent, text="OFFLINE", color=MUTED, width=136,
+                 height=30, bg=None, **kw):
+        self._bg = bg or parent.cget("background")
+        super().__init__(parent, width=width, height=height, bd=0,
+                         highlightthickness=0, bg=self._bg, takefocus=0, **kw)
+        self._text = text
+        self._color = color
+        self.bind("<Configure>", self._redraw, add="+")
+
+    def _redraw(self, _e=None):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        self.create_polygon(
+            rounded_points(1, 1, w - 1, h - 1, (h - 2) / 2.0),
+            smooth=True, splinesteps=20,
+            fill=SURFACE_2, outline=LINE, width=1,
+        )
+        cy = h / 2
+        self.create_oval(14, cy - 4, 22, cy + 4, fill=self._color, outline="")
+        self.create_text(30, cy + 1, text=self._text, fill=self._color,
+                         font=font(9, "bold"), anchor="w")
+
+    def set(self, text, color):
+        if text == self._text and color == self._color:
+            return
+        self._text = text
+        self._color = color
+        self._redraw()
+
+
+# ==========================================================================
+# MAIN APPLICATION
+# ==========================================================================
+
+class CameraApp:
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title(f"{APP_NAME}  -  v{APP_VERSION}")
+        self.root.configure(bg=BG)
+        self.root.minsize(1180, 720)
         self._start_window()
 
+        # -- stream / frame state -----------------------------------------
         self.stream = None
         self.last_frame = None
         self.display_image = None
+        self.fs_image = None
+        self.closed = False
+
+        # -- view state ----------------------------------------------------
         self.zoom = 1.0
-        self.pan_x = 0.0
-        self.pan_y = 0.0
+        self.pan_x = 0
+        self.pan_y = 0
         self.drag_start = None
         self.freeze = False
+
+        # -- recording state ------------------------------------------------
         self.recording = False
         self.writer = None
         self.record_path = None
         self.record_started = 0.0
         self.record_frames = 0
         self.last_record_id = -1
-        self.display_fps = 0.0
-        self.last_frame_counter = 0
-        self.last_fps_time = time.time()
-        self.closed = False
-        self.viewer_mode = "live"
 
+        # -- statistics -----------------------------------------------------
+        self.display_fps = 0.0
+        self.frames_since = 0
+        self.last_frame_counter = -1
+        self.last_fps_time = time.time()
+
+        # -- fullscreen video window (FIX 3) --------------------------------
+        self.fs_window = None
+        self.fs_canvas = None
+
+        # -- overlay visibility bookkeeping (FIX 2) -------------------------
+        self._overlay_shown = None      # None = never laid out yet
+
+        # -- tk variables ----------------------------------------------------
         self.camera_ip = tk.StringVar(value=CAMERA_IP_DEFAULT)
         self.camera_port = tk.StringVar(value=str(CAMERA_PORT_DEFAULT))
         self.auto_start = tk.BooleanVar(value=True)
         self.zoom_var = tk.DoubleVar(value=1.0)
         self.brightness_var = tk.IntVar(value=0)
-        self.contrast_var = tk.DoubleVar(value=1.0)
-        self.saturation_var = tk.DoubleVar(value=1.0)
-        self.gamma_var = tk.DoubleVar(value=1.0)
-        self.sharpness_var = tk.DoubleVar(value=0.0)
-        self.denoise_var = tk.BooleanVar(value=False)
+        self.contrast_var = tk.IntVar(value=0)
+        self.saturation_var = tk.IntVar(value=100)
+        self.gamma_var = tk.IntVar(value=100)
+        self.sharpness_var = tk.IntVar(value=0)
+        self.denoise_var = tk.IntVar(value=0)
         self.flip_h = tk.BooleanVar(value=False)
         self.flip_v = tk.BooleanVar(value=False)
-        self.rotate_var = tk.StringVar(value="0°")
+        self.rotate_var = tk.StringVar(value="0")
         self.grid_var = tk.BooleanVar(value=False)
         self.crosshair_var = tk.BooleanVar(value=False)
         self.timestamp_var = tk.BooleanVar(value=False)
-        self.safe_overlay_var = tk.BooleanVar(value=True)
+        self.chrome_var = tk.BooleanVar(value=True)
         self.save_dir_var = tk.StringVar(value=str(CAPTURE_DIR))
-        self.drawer_visible = tk.BooleanVar(value=False)
+        self.drawer_visible = False
 
         self._build_styles()
         self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.bind("<Escape>", self._escape)
-        self.bind("<F11>", lambda _e: self.toggle_fullscreen())
-        self.bind("<space>", lambda _e: self.toggle_freeze())
-        self.bind("<Control-s>", lambda _e: self.capture_snapshot())
-        self.bind("<Control-r>", lambda _e: self.toggle_record())
-        self.bind("<plus>", lambda _e: self.zoom_step(0.1))
-        self.bind("<equal>", lambda _e: self.zoom_step(0.1))
-        self.bind("<minus>", lambda _e: self.zoom_step(-0.1))
-        self.after(40, self.ui_tick)
-        if self.auto_start.get():
-            self.after(350, self.connect_camera)
 
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.bind("<Escape>", self._escape)
+        self.root.bind("<F11>", lambda _e: self.toggle_video_fullscreen())
+        self.root.bind("<space>", lambda _e: self.toggle_freeze())
+        self.root.bind("<Control-s>", lambda _e: self.capture_snapshot())
+        self.root.bind("<Control-r>", lambda _e: self.toggle_record())
+        self.root.bind("<plus>", lambda _e: self.zoom_step(0.2))
+        self.root.bind("<equal>", lambda _e: self.zoom_step(0.2))
+        self.root.bind("<minus>", lambda _e: self.zoom_step(-0.2))
+
+        self.root.after(80, self.ui_tick)
+        if self.auto_start.get():
+            self.root.after(300, self.connect_camera)
+
+    # ------------------------------------------------------------------
+    # WINDOW / STYLE SETUP
+    # ------------------------------------------------------------------
     def _start_window(self):
         try:
-            self.state("zoomed")
+            self.root.state("zoomed")
         except tk.TclError:
-            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-            self.geometry(f"{min(1320, sw-30)}x{min(820, sh-70)}")
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            self.root.geometry(f"{min(sw, 1600)}x{min(sh - 60, 940)}+40+20")
 
     def _build_styles(self):
-        self.option_add("*Font", "Arial 10")
-        self.option_add("*Entry.background", SURFACE_2)
-        self.option_add("*Entry.foreground", TEXT)
-        self.option_add("*Entry.insertBackground", TEXT)
+        self.root.option_add("*Font", font(10))
+        self.root.option_add("*Entry.background", SURFACE_2)
+        self.root.option_add("*Entry.foreground", TEXT)
+        self.root.option_add("*Entry.insertBackground", TEAL)
 
-    def _label(self, parent, text, size=10, color=TEXT, weight="normal", bg=None, anchor="w"):
-        return tk.Label(parent, text=text, bg=bg or parent.cget("bg"), fg=color,
-                        font=("Arial", size, "bold" if weight == "semibold" else "normal"), anchor=anchor)
+    def _label(self, parent, text, size=10, color=TEXT, weight="normal",
+               bg=None, anchor="w", **kw):
+        return tk.Label(parent, text=text, font=font(size, weight),
+                        fg=color, bg=bg or parent.cget("background"),
+                        anchor=anchor, **kw)
 
+    # ------------------------------------------------------------------
+    # LAYOUT
+    # ------------------------------------------------------------------
     def _build_ui(self):
-        # Header
-        header = tk.Frame(self, bg=SURFACE, height=72)
-        header.pack(fill="x")
+        # ---------------- header ----------------
+        header = tk.Frame(self.root, bg=BG, height=76)
+        header.pack(side="top", fill="x", padx=18, pady=(14, 8))
         header.pack_propagate(False)
 
-        brand = tk.Frame(header, bg=SURFACE)
-        brand.pack(side="left", fill="y", padx=20)
-        logo = tk.Canvas(brand, width=42, height=42, bg=SURFACE, highlightthickness=0)
-        logo.pack(side="left", pady=14)
-        logo.create_oval(3, 3, 39, 39, fill=TEAL_SOFT, outline=TEAL, width=2)
-        logo.create_text(21, 21, text="C", fill=TEAL, font=("Arial", 17, "bold"))
-        text_box = tk.Frame(brand, bg=SURFACE)
-        text_box.pack(side="left", padx=(10, 0), pady=11)
-        tk.Label(text_box, text="CARE ENT Scope", bg=SURFACE, fg=TEXT, font=("Arial", 19, "bold")).pack(anchor="w")
-        tk.Label(text_box, text="PROFESSIONAL CAMERA WORKSTATION", bg=SURFACE, fg="#76B4BC", font=("Arial", 8)).pack(anchor="w", pady=(1,0))
+        brand = tk.Frame(header, bg=BG)
+        brand.pack(side="left", fill="y")
 
-        self.header_status = tk.Frame(header, bg=SURFACE)
-        self.header_status.pack(side="right", fill="y", padx=18)
-        self.connection_badge = tk.Label(self.header_status, text="● WAITING", bg=SURFACE, fg=AMBER, font=("Arial", 10, "bold"))
-        self.connection_badge.pack(side="right", padx=(10, 0), pady=26)
-        ModernButton(self.header_status, "About", self.show_about, width=96, height=38, icon="ⓘ").pack(side="right", padx=5, pady=17)
-        ModernButton(self.header_status, "Full Screen", self.toggle_fullscreen, width=112, height=38, icon="⛶").pack(side="right", padx=5, pady=17)
-        self.settings_button = ModernButton(self.header_status, "Controls", self.toggle_drawer, width=105, height=38, icon="☷")
-        self.settings_button.pack(side="right", padx=5, pady=17)
+        logo = tk.Canvas(brand, width=46, height=46, bd=0, highlightthickness=0, bg=BG)
+        logo.pack(side="left", padx=(0, 14))
+        logo.create_polygon(rounded_points(1, 1, 45, 45, 14), smooth=True,
+                            splinesteps=20, fill=TEAL_SOFT, outline=TEAL, width=1)
+        logo.create_text(23, 24, text="C", fill=TEAL, font=font(20, "bold"))
 
-        # Main area
-        main = tk.Frame(self, bg=BG)
-        main.pack(fill="both", expand=True)
-        main.grid_rowconfigure(0, weight=1)
-        main.grid_columnconfigure(0, weight=1)
+        text_box = tk.Frame(brand, bg=BG)
+        text_box.pack(side="left", fill="y")
+        self._label(text_box, APP_NAME, size=15, weight="bold", bg=BG).pack(anchor="w")
+        self._label(text_box, "PROFESSIONAL CAMERA WORKSTATION", size=8,
+                    color="#6FA8B0", bg=BG).pack(anchor="w", pady=(2, 0))
 
-        viewer_wrap = tk.Frame(main, bg=BLACK)
-        viewer_wrap.grid(row=0, column=0, sticky="nsew", padx=14, pady=(14, 0))
-        viewer_wrap.grid_rowconfigure(0, weight=1)
-        viewer_wrap.grid_columnconfigure(0, weight=1)
+        right = tk.Frame(header, bg=BG)
+        right.pack(side="right", fill="y")
 
-        self.video_canvas = tk.Canvas(viewer_wrap, bg=BLACK, highlightthickness=0, cursor="crosshair")
-        self.video_canvas.grid(row=0, column=0, sticky="nsew")
+        self.settings_button = RoundButton(right, text="Controls", kind="secondary",
+                                           command=self.toggle_drawer, bg=BG)
+        self.settings_button.pack(side="right", padx=(8, 0), pady=8)
+
+        self.fullscreen_button = RoundButton(right, text="Full Screen", kind="secondary",
+                                             command=self.toggle_video_fullscreen, bg=BG)
+        self.fullscreen_button.pack(side="right", padx=8, pady=8)
+
+        RoundButton(right, text="About", kind="ghost",
+                    command=self.show_about, bg=BG).pack(side="right", padx=8, pady=8)
+
+        self.connection_badge = StatusBadge(right, text="OFFLINE", color=MUTED, bg=BG)
+        self.connection_badge.pack(side="right", padx=(8, 12), pady=8)
+
+        # ---------------- footer ----------------
+        # Packed before the viewer so the expanding viewer cannot squeeze the
+        # fixed-height chrome out of the layout.
+        footer = tk.Frame(self.root, bg=BG, height=34)
+        footer.pack(side="bottom", fill="x", padx=18, pady=(0, 12))
+        footer.pack_propagate(False)
+        self.status_label = self._label(footer, "Ready", size=9, color=MUTED, bg=BG)
+        self.status_label.pack(side="left")
+        self._label(footer,
+                    "Ctrl+S Snapshot     Ctrl+R Record     Space Freeze     F11 Video full screen",
+                    size=9, color=DIM, bg=BG, anchor="e").pack(side="right")
+
+        # ---------------- command deck ----------------
+        self._build_command_deck()
+
+        # ---------------- main viewer ----------------
+        main = tk.Frame(self.root, bg=BG)
+        main.pack(side="top", fill="both", expand=True, padx=18)
+
+        self.viewer_card = RoundedPanel(main, radius=18, fill=BLACK,
+                                        border=LINE, bg=BG)
+        self.viewer_card.pack(fill="both", expand=True)
+
+        viewer = self.viewer_card.body
+        self.video_canvas = tk.Canvas(viewer, bg=BLACK, bd=0, highlightthickness=0,
+                                      cursor="crosshair")
+        self.video_canvas.pack(fill="both", expand=True)
         self.video_canvas.bind("<ButtonPress-1>", self.on_pan_start)
         self.video_canvas.bind("<B1-Motion>", self.on_pan_move)
         self.video_canvas.bind("<ButtonRelease-1>", self.on_pan_end)
         self.video_canvas.bind("<MouseWheel>", self.on_mouse_zoom)
-        self.video_canvas.bind("<Double-Button-1>", lambda _e: self.set_zoom(1.0))
+        self.video_canvas.bind("<Button-4>", lambda e: self.zoom_step(0.15))
+        self.video_canvas.bind("<Button-5>", lambda e: self.zoom_step(-0.15))
+        self.video_canvas.bind("<Double-Button-1>",
+                               lambda _e: self.toggle_video_fullscreen())
 
-        # Viewer chrome
-        top_chrome = tk.Frame(viewer_wrap, bg="#071217", height=44)
-        top_chrome.place(relx=0.02, rely=0.018, relwidth=0.96, height=44)
-        top_chrome.pack_propagate(False)
-        self.viewer_title = tk.Label(top_chrome, text="LIVE VIEW", bg="#071217", fg=TEXT, font=("Arial", 9, "bold"))
-        self.viewer_title.pack(side="left", padx=14)
-        self.viewer_meta = tk.Label(top_chrome, text="No signal", bg="#071217", fg=MUTED, font=("Arial", 9))
-        self.viewer_meta.pack(side="left", padx=8)
-        self.viewer_rec = tk.Label(top_chrome, text="", bg="#071217", fg=RED, font=("Arial", 9, "bold"))
-        self.viewer_rec.pack(side="right", padx=14)
+        # viewer chrome (floating labels over the video)
+        self.viewer_title = self._label(viewer, "LIVE VIEW", size=9, weight="bold",
+                                        color=TEAL, bg=BLACK)
+        self.viewer_title.place(x=18, y=14)
 
-        # Empty state
-        self.empty_title = tk.Label(viewer_wrap, text="Camera ready", bg=BLACK, fg=TEXT, font=("Arial", 22, "bold"))
-        self.empty_title.place(relx=0.5, rely=0.46, anchor="center")
-        self.empty_sub = tk.Label(viewer_wrap, text="Connect to the Wi-Fi scope to start live viewing", bg=BLACK, fg=MUTED, font=("Arial", 10))
-        self.empty_sub.place(relx=0.5, rely=0.515, anchor="center")
-        ModernButton(viewer_wrap, "Connect Camera", self.connect_camera, width=175, height=40, kind="primary", icon="◉").place(relx=0.5, rely=0.58, anchor="center")
+        self.viewer_meta = self._label(viewer, "No signal", size=9, color=MUTED,
+                                       bg=BLACK, anchor="e")
+        self.viewer_meta.place(relx=1.0, x=-18, y=14, anchor="ne")
 
-        # Bottom command deck
-        deck = tk.Frame(main, bg=BG, height=92)
-        deck.grid(row=1, column=0, sticky="ew", padx=14, pady=(10, 14))
-        deck.pack_propagate(False)
-        self._build_command_deck(deck)
+        self.viewer_rec = self._label(viewer, "", size=9, weight="bold",
+                                      color=RED, bg=BLACK)
+        self.viewer_rec.place(x=18, y=36)
 
-        # Side control drawer (starts hidden)
-        self.drawer = tk.Frame(main, bg=SURFACE, width=330, highlightthickness=1, highlightbackground=LINE)
-        self.drawer_visible_state = False
-        self.drawer.place_forget()
+        # ---------- welcome / empty-state overlay (FIX 2) ----------
+        self.empty_overlay = tk.Frame(viewer, bg=BLACK)
+        self._label(self.empty_overlay, "Camera ready", size=17, weight="bold",
+                    bg=BLACK, anchor="center").pack()
+        self._label(self.empty_overlay,
+                    "Connect to the Wi-Fi scope to start live viewing",
+                    size=10, color=MUTED, bg=BLACK, anchor="center").pack(pady=(8, 20))
+        self.overlay_button = RoundButton(self.empty_overlay, text="Connect Camera",
+                                          kind="primary", command=self.connect_camera,
+                                          height=44, font_size=11, padding=30, bg=BLACK)
+        self.overlay_button.pack()
+        self._sync_overlay(force=True)
 
-        # Footer
-        footer = tk.Frame(self, bg="#061116", height=26)
-        footer.pack(fill="x")
-        footer.pack_propagate(False)
-        self.status_label = tk.Label(footer, text="Ready", bg="#061116", fg=MUTED, anchor="w", font=("Consolas", 8))
-        self.status_label.pack(side="left", fill="x", expand=True, padx=12)
-        tk.Label(footer, text="Ctrl+S Snapshot   Ctrl+R Record   Space Freeze   F11 Fullscreen", bg="#061116", fg="#5E7E85", font=("Arial", 8)).pack(side="right", padx=12)
+        # ---------------- controls drawer ----------------
+        self.drawer = RoundedPanel(self.root, radius=18, fill=SURFACE,
+                                   border=LINE, bg=BG)
+        self.drawer_built = False
 
-    def _build_command_deck(self, parent):
-        left = tk.Frame(parent, bg=SURFACE)
-        left.pack(side="left", fill="both", expand=False)
-        left.configure(width=360)
-        left.pack_propagate(False)
-        tk.Label(left, text="CAPTURE", bg=SURFACE, fg=MUTED, font=("Arial", 8, "bold")).pack(anchor="w", padx=14, pady=(10,4))
-        row = tk.Frame(left, bg=SURFACE)
-        row.pack(fill="x", padx=12, pady=(0, 10))
-        self.snapshot_button = ModernButton(row, "Snapshot", self.capture_snapshot, height=44, kind="primary", icon="◉")
-        self.snapshot_button.pack(side="left", fill="x", expand=True, padx=(0,5))
-        self.record_button = ModernButton(row, "Start Recording", self.toggle_record, height=44, icon="●")
-        self.record_button.pack(side="left", fill="x", expand=True, padx=(5,0))
+    def _build_command_deck(self):
+        deck_wrap = tk.Frame(self.root, bg=BG)
+        deck_wrap.pack(side="bottom", fill="x", padx=18, pady=(12, 0))
 
-        center = tk.Frame(parent, bg=SURFACE)
-        center.pack(side="left", fill="both", expand=True, padx=8)
-        tk.Label(center, text="VIEW", bg=SURFACE, fg=MUTED, font=("Arial", 8, "bold")).pack(anchor="w", padx=12, pady=(10,4))
-        row2 = tk.Frame(center, bg=SURFACE)
-        row2.pack(fill="x", padx=12, pady=(0,10))
-        for label, cmd, icon in [
-            ("Fit", lambda: self.set_zoom(1.0), "⌂"),
-            ("Zoom −", lambda: self.zoom_step(-0.1), "−"),
-            ("Zoom +", lambda: self.zoom_step(0.1), "+"),
-            ("Mirror", self.toggle_mirror, "↔"),
-            ("Rotate", self.rotate_once, "⟳"),
-            ("Freeze", self.toggle_freeze, "❚❚"),
-        ]:
-            ModernButton(row2, label, cmd, height=44, icon=icon).pack(side="left", fill="x", expand=True, padx=3)
+        deck_card = RoundedPanel(deck_wrap, radius=16, fill=SURFACE, border=LINE,
+                                 bg=BG, autosize=True)
+        deck_card.pack(fill="x")
+        deck = deck_card.body
+        inner = tk.Frame(deck, bg=SURFACE)
+        inner.pack(fill="x", padx=18, pady=14)
 
-        right = tk.Frame(parent, bg=SURFACE)
-        right.pack(side="right", fill="both", expand=False)
-        right.configure(width=250)
-        right.pack_propagate(False)
-        tk.Label(right, text="SESSION", bg=SURFACE, fg=MUTED, font=("Arial", 8, "bold")).pack(anchor="w", padx=14, pady=(10,4))
-        row3 = tk.Frame(right, bg=SURFACE)
-        row3.pack(fill="x", padx=12, pady=(0,10))
-        ModernButton(row3, "Captures", lambda: self.open_folder(self.save_dir_var.get()), height=44, icon="▧").pack(side="left", fill="x", expand=True, padx=(0,4))
-        ModernButton(row3, "Videos", lambda: self.open_folder(VIDEO_DIR), height=44, icon="▶").pack(side="left", fill="x", expand=True, padx=(4,0))
+        # -- CAPTURE ------------------------------------------------------
+        cap = tk.Frame(inner, bg=SURFACE)
+        cap.pack(side="left", fill="y")
+        self._section_title(cap, "CAPTURE")
+        cap_row = tk.Frame(cap, bg=SURFACE)
+        cap_row.pack(anchor="w", pady=(8, 0))
 
-    def _section_title(self, parent, title, subtitle=None):
-        row = tk.Frame(parent, bg=SURFACE)
-        row.pack(fill="x", padx=16, pady=(14,6))
-        tk.Label(row, text=title.upper(), bg=SURFACE, fg=TEAL, font=("Arial", 9, "bold")).pack(anchor="w")
-        if subtitle:
-            tk.Label(row, text=subtitle, bg=SURFACE, fg=MUTED, font=("Arial", 8)).pack(anchor="w", pady=(2,0))
+        self.snapshot_button = RoundButton(cap_row, text="Snapshot", kind="primary",
+                                           command=self.capture_snapshot, bg=SURFACE)
+        self.snapshot_button.pack(side="left", padx=(0, 8))
 
-    def _entry(self, parent, label, variable, width=20):
-        row = tk.Frame(parent, bg=SURFACE)
-        row.pack(fill="x", padx=16, pady=5)
-        tk.Label(row, text=label, bg=SURFACE, fg=MUTED, font=("Arial", 9)).pack(side="left")
-        entry = tk.Entry(row, textvariable=variable, width=width, bg="#07171D", fg=TEXT, relief="flat", insertbackground=TEXT,
-                         font=("Arial", 9), highlightthickness=1, highlightbackground=LINE, highlightcolor=TEAL)
-        entry.pack(side="right", ipady=5)
-        return entry
+        self.record_button = RoundButton(cap_row, text="Start Recording", kind="secondary",
+                                         command=self.toggle_record, bg=SURFACE)
+        self.record_button.pack(side="left")
 
-    def _slider(self, parent, label, variable, lo, hi, resolution=0.1, fmt=None):
-        row = tk.Frame(parent, bg=SURFACE)
-        row.pack(fill="x", padx=16, pady=4)
-        top = tk.Frame(row, bg=SURFACE)
-        top.pack(fill="x")
-        tk.Label(top, text=label, bg=SURFACE, fg="#B5CDD2", font=("Arial", 9)).pack(side="left")
-        value = tk.Label(top, text="", bg=SURFACE, fg=TEXT, font=("Arial", 9, "bold"))
-        value.pack(side="right")
-        def update(_=None):
-            v = variable.get()
-            value.config(text=(fmt(v) if fmt else str(v)))
-        scale = tk.Scale(row, from_=lo, to=hi, resolution=resolution, orient="horizontal", variable=variable,
-                         bg=SURFACE, fg=TEXT, troughcolor="#193C44", activebackground=TEAL,
-                         highlightthickness=0, showvalue=False, borderwidth=0, command=lambda _v: update())
-        scale.pack(fill="x")
-        update()
-        return scale
+        self._deck_divider(inner)
 
+        # -- VIEW ---------------------------------------------------------
+        view = tk.Frame(inner, bg=SURFACE)
+        view.pack(side="left", fill="y")
+        self._section_title(view, "VIEW")
+        view_row = tk.Frame(view, bg=SURFACE)
+        view_row.pack(anchor="w", pady=(8, 0))
+
+        for label, cmd in (
+            ("Fit", lambda: self.set_zoom(1.0)),
+            ("Zoom -", lambda: self.zoom_step(-0.2)),
+            ("Zoom +", lambda: self.zoom_step(0.2)),
+            ("Mirror", self.toggle_mirror),
+            ("Rotate", self.rotate_once),
+        ):
+            RoundButton(view_row, text=label, kind="secondary", command=cmd,
+                        bg=SURFACE).pack(side="left", padx=(0, 8))
+
+        self.freeze_button = RoundButton(view_row, text="Freeze", kind="secondary",
+                                         command=self.toggle_freeze, bg=SURFACE)
+        self.freeze_button.pack(side="left")
+
+        self._deck_divider(inner)
+
+        # -- SESSION ------------------------------------------------------
+        sess = tk.Frame(inner, bg=SURFACE)
+        sess.pack(side="left", fill="y")
+        self._section_title(sess, "SESSION")
+        sess_row = tk.Frame(sess, bg=SURFACE)
+        sess_row.pack(anchor="w", pady=(8, 0))
+
+        RoundButton(sess_row, text="Captures", kind="secondary",
+                    command=lambda: self.open_folder(self.save_dir_var.get()),
+                    bg=SURFACE).pack(side="left", padx=(0, 8))
+        RoundButton(sess_row, text="Videos", kind="secondary",
+                    command=lambda: self.open_folder(str(VIDEO_DIR)),
+                    bg=SURFACE).pack(side="left")
+
+        # -- connection button on the right of the deck --------------------
+        conn = tk.Frame(inner, bg=SURFACE)
+        conn.pack(side="right", fill="y")
+        self._section_title(conn, "CONNECTION", anchor="e")
+        conn_row = tk.Frame(conn, bg=SURFACE)
+        conn_row.pack(anchor="e", pady=(8, 0))
+        self.deck_connect_button = RoundButton(conn_row, text="Connect",
+                                               kind="primary",
+                                               command=self.toggle_connection,
+                                               bg=SURFACE)
+        self.deck_connect_button.pack(side="right")
+
+    def _deck_divider(self, parent):
+        tk.Frame(parent, bg=LINE, width=1).pack(side="left", fill="y", padx=20, pady=4)
+
+    def _section_title(self, parent, text, anchor="w"):
+        self._label(parent, text.upper(), size=8, weight="bold",
+                    color=DIM, anchor=anchor).pack(anchor=anchor)
+
+    # ------------------------------------------------------------------
+    # CONTROLS DRAWER
+    # ------------------------------------------------------------------
     def toggle_drawer(self):
-        if self.drawer_visible_state:
+        if self.drawer_visible:
             self.drawer.place_forget()
-            self.drawer_visible_state = False
-            self.settings_button.set("☷  Controls")
+            self.drawer_visible = False
+            self.settings_button.set_text("Controls")
             return
-        self._populate_drawer()
-        self.drawer.place(relx=1.0, x=-14, y=14, anchor="ne", relheight=0.82)
-        self.drawer_visible_state = True
-        self.settings_button.set("✕  Close")
+        if not self.drawer_built:
+            self._populate_drawer()
+            self.drawer_built = True
+        self.drawer.place(relx=1.0, rely=0, x=-18, y=96, anchor="ne",
+                          width=410, relheight=0.70)
         self.drawer.lift()
+        self.drawer_visible = True
+        self.settings_button.set_text("Close Controls")
 
     def _populate_drawer(self):
-        for child in self.drawer.winfo_children():
-            child.destroy()
-        header = tk.Frame(self.drawer, bg=SURFACE_2, height=62)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-        tk.Label(header, text="CONTROL CENTER", bg=SURFACE_2, fg=TEXT, font=("Arial", 13, "bold")).pack(anchor="w", padx=18, pady=(12,0))
-        tk.Label(header, text="Camera connection, image and overlays", bg=SURFACE_2, fg=MUTED, font=("Arial", 8)).pack(anchor="w", padx=18)
+        body = self.drawer.body
+        head = tk.Frame(body, bg=SURFACE)
+        head.pack(fill="x", padx=18, pady=(16, 8))
+        self._label(head, "CONTROL CENTER", size=11, weight="bold", bg=SURFACE).pack(anchor="w")
+        self._label(head, "Camera connection, image and overlays", size=9,
+                    color=MUTED, bg=SURFACE).pack(anchor="w", pady=(2, 0))
 
-        canvas = tk.Canvas(self.drawer, bg=SURFACE, highlightthickness=0)
-        canvas.pack(fill="both", expand=True)
+        # ---- scrollable region: vertical scrollbar on the side plus a
+        # ---- horizontal scrollbar, so nothing in the panel is ever clipped.
+        wrap = tk.Frame(body, bg=SURFACE)
+        wrap.pack(fill="both", expand=True, padx=(10, 6), pady=(4, 12))
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(wrap, bg=SURFACE, bd=0, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+
+        bar_style = dict(bg=SURFACE_3, troughcolor=SURFACE_2, activebackground=TEAL,
+                         bd=0, relief="flat", highlightthickness=0)
+        vbar = tk.Scrollbar(wrap, orient="vertical", command=canvas.yview,
+                            width=12, **bar_style)
+        vbar.grid(row=0, column=1, sticky="ns", padx=(4, 0))
+        hbar = tk.Scrollbar(wrap, orient="horizontal", command=canvas.xview,
+                            width=12, **bar_style)
+        hbar.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        canvas.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+
         inner = tk.Frame(canvas, bg=SURFACE)
-        canvas.create_window((0,0), window=inner, anchor="nw", tags="inner")
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure("inner", width=e.width))
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
 
-        self._section_title(inner, "Connection", "Wi-Fi scope endpoint")
+        def _resize(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            # Stretch the content to the panel width, but never below its own
+            # natural width - that surplus is what the horizontal bar scrolls.
+            canvas.itemconfigure(
+                window, width=max(canvas.winfo_width(), inner.winfo_reqwidth()))
+
+        inner.bind("<Configure>", _resize, add="+")
+        canvas.bind("<Configure>", _resize, add="+")
+
+        # ---- mouse wheel: plain wheel scrolls vertically, Shift+wheel
+        # ---- scrolls horizontally, only while the pointer is over the panel.
+        def _wheel(event):
+            step = -1 if getattr(event, "delta", 0) > 0 or event.num == 4 else 1
+            canvas.yview_scroll(step, "units")
+
+        def _shift_wheel(event):
+            step = -1 if getattr(event, "delta", 0) > 0 or event.num == 4 else 1
+            canvas.xview_scroll(step, "units")
+
+        def _bind_wheel(_e=None):
+            canvas.bind_all("<MouseWheel>", _wheel)
+            canvas.bind_all("<Shift-MouseWheel>", _shift_wheel)
+            canvas.bind_all("<Button-4>", _wheel)
+            canvas.bind_all("<Button-5>", _wheel)
+
+        def _unbind_wheel(_e=None):
+            for seq in ("<MouseWheel>", "<Shift-MouseWheel>", "<Button-4>", "<Button-5>"):
+                canvas.unbind_all(seq)
+
+        for widget in (canvas, inner):
+            widget.bind("<Enter>", _bind_wheel, add="+")
+            widget.bind("<Leave>", _unbind_wheel, add="+")
+        self.drawer.bind("<Unmap>", _unbind_wheel, add="+")
+
+        # ---- Connection ----
+        self._drawer_section(inner, "Connection", "Wi-Fi scope endpoint")
         self._entry(inner, "Camera IP", self.camera_ip)
-        self._entry(inner, "UDP Port", self.camera_port, 8)
-        btnrow = tk.Frame(inner, bg=SURFACE)
-        btnrow.pack(fill="x", padx=16, pady=6)
-        ModernButton(btnrow, "Connect", self.connect_camera, height=36, kind="primary", icon="◉").pack(side="left", fill="x", expand=True, padx=(0,4))
-        ModernButton(btnrow, "Disconnect", self.disconnect_camera, height=36, icon="○").pack(side="left", fill="x", expand=True, padx=(4,0))
+        self._entry(inner, "UDP Port", self.camera_port)
+        row = tk.Frame(inner, bg=SURFACE)
+        row.pack(fill="x", padx=10, pady=(10, 4))
+        self.drawer_connect_button = RoundButton(row, text="Connect", kind="primary",
+                                                 command=self.connect_camera, bg=SURFACE)
+        self.drawer_connect_button.pack(side="left", padx=(0, 8))
+        RoundButton(row, text="Disconnect", kind="secondary",
+                    command=self.disconnect_camera, bg=SURFACE).pack(side="left")
         self._check(inner, "Auto-connect on launch", self.auto_start)
 
-        self._section_title(inner, "Image", "Software processing — camera hardware exposure is unchanged")
-        self._slider(inner, "Brightness", self.brightness_var, -60, 60, 1, lambda v: f"{int(v):+d}")
-        self._slider(inner, "Contrast", self.contrast_var, 0.5, 2.0, 0.1, lambda v: f"{v:.1f}×")
-        self._slider(inner, "Saturation", self.saturation_var, 0.0, 2.0, 0.1, lambda v: f"{v:.1f}×")
-        self._slider(inner, "Gamma", self.gamma_var, 0.5, 2.0, 0.1, lambda v: f"{v:.1f}")
-        self._slider(inner, "Sharpness", self.sharpness_var, 0.0, 2.0, 0.1, lambda v: f"{v:.1f}")
-        self._check(inner, "Soft denoise", self.denoise_var)
+        # ---- Image ----
+        self._drawer_section(inner, "Image",
+                             "Software processing - camera hardware exposure is unchanged")
+        self._slider(inner, "Brightness", self.brightness_var, -100, 100)
+        self._slider(inner, "Contrast", self.contrast_var, -100, 100)
+        self._slider(inner, "Saturation", self.saturation_var, 0, 200)
+        self._slider(inner, "Gamma", self.gamma_var, 50, 200)
+        self._slider(inner, "Sharpness", self.sharpness_var, 0, 100)
+        self._slider(inner, "Soft denoise", self.denoise_var, 0, 100)
 
-        self._section_title(inner, "Orientation", "Preview and capture transforms")
+        # ---- Orientation ----
+        self._drawer_section(inner, "Orientation", "Preview and capture transforms")
         self._check(inner, "Mirror horizontally", self.flip_h)
         self._check(inner, "Flip vertically", self.flip_v)
-        rrow = tk.Frame(inner, bg=SURFACE)
-        rrow.pack(fill="x", padx=16, pady=5)
-        tk.Label(rrow, text="Rotation", bg=SURFACE, fg=MUTED, font=("Arial", 9)).pack(side="left")
-        opts = ["0°", "90°", "180°", "270°"]
-        menu = tk.OptionMenu(rrow, self.rotate_var, *opts)
-        menu.config(bg=SURFACE_3, fg=TEXT, activebackground=TEAL_DARK, activeforeground=TEXT, relief="flat", highlightthickness=0)
-        menu["menu"].config(bg=SURFACE_3, fg=TEXT, activebackground=TEAL_DARK, activeforeground=TEXT)
-        menu.pack(side="right")
-        btnrow2 = tk.Frame(inner, bg=SURFACE)
-        btnrow2.pack(fill="x", padx=16, pady=(6,4))
-        ModernButton(btnrow2, "Fit", lambda: self.set_zoom(1.0), height=34, icon="⌂").pack(side="left", fill="x", expand=True, padx=(0,3))
-        ModernButton(btnrow2, "Reset", self.reset_image, height=34, icon="↺").pack(side="left", fill="x", expand=True, padx=(3,0))
+        rot = tk.Frame(inner, bg=SURFACE)
+        rot.pack(fill="x", padx=10, pady=(6, 4))
+        self._label(rot, "Rotation", size=9, color=MUTED, bg=SURFACE).pack(side="left")
+        opts = tk.OptionMenu(rot, self.rotate_var, "0", "90", "180", "270")
+        opts.configure(bg=SURFACE_2, fg=TEXT, activebackground=SURFACE_3,
+                       activeforeground=TEXT, bd=0, highlightthickness=0,
+                       font=font(9), width=6)
+        opts["menu"].configure(bg=SURFACE_2, fg=TEXT, bd=0,
+                               activebackground=TEAL_DARK, font=font(9))
+        opts.pack(side="right")
 
-        self._section_title(inner, "Overlays", "Visual aids are included in display and capture")
+        # ---- Overlays ----
+        self._drawer_section(inner, "Overlays",
+                             "Visual aids are included in display and capture")
         self._check(inner, "Composition grid", self.grid_var)
         self._check(inner, "Crosshair", self.crosshair_var)
         self._check(inner, "Timestamp", self.timestamp_var)
-        self._check(inner, "Viewer chrome", self.safe_overlay_var)
+        self._check(inner, "Viewer chrome", self.chrome_var)
 
-        self._section_title(inner, "Session", "Local workstation storage")
-        ModernButton(inner, "Choose Capture Folder", self.choose_save_folder, height=36, icon="▧").pack(fill="x", padx=16, pady=4)
-        tk.Label(inner, textvariable=self.save_dir_var, bg=SURFACE, fg=MUTED, justify="left", wraplength=275,
-                 font=("Arial", 8)).pack(fill="x", padx=18, pady=(0,6))
-        ModernButton(inner, "Reset All Controls", self.reset_image, height=36, icon="↺").pack(fill="x", padx=16, pady=4)
-        tk.Label(inner, text="", bg=SURFACE, height=2).pack()
+        # ---- Session ----
+        self._drawer_section(inner, "Session", "Local workstation storage")
+        self._label(inner, self.save_dir_var.get(), size=8, color=DIM, bg=SURFACE,
+                    wraplength=320, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+        row2 = tk.Frame(inner, bg=SURFACE)
+        row2.pack(fill="x", padx=10, pady=(0, 6))
+        RoundButton(row2, text="Choose Capture Folder", kind="secondary",
+                    command=self.choose_save_folder, bg=SURFACE).pack(side="left")
+        RoundButton(inner, text="Reset All Controls", kind="ghost",
+                    command=self.reset_image, bg=SURFACE).pack(anchor="w", padx=10, pady=(8, 16))
 
-    def _check(self, parent, text, variable):
-        cb = tk.Checkbutton(parent, text=text, variable=variable, bg=SURFACE, fg="#B5CDD2", activebackground=SURFACE,
-                            activeforeground=TEXT, selectcolor=TEAL_DARK, font=("Arial", 9), anchor="w", relief="flat")
-        cb.pack(fill="x", padx=16, pady=3)
-        return cb
+    def _drawer_section(self, parent, title, subtitle):
+        tk.Frame(parent, bg=LINE, height=1).pack(fill="x", padx=10, pady=(16, 12))
+        self._label(parent, title, size=10, weight="bold",
+                    bg=SURFACE).pack(anchor="w", padx=10)
+        self._label(parent, subtitle, size=8, color=DIM, bg=SURFACE,
+                    wraplength=330, justify="left").pack(anchor="w", padx=10, pady=(2, 8))
 
-    def _escape(self, _event):
-        if self.drawer_visible_state:
-            self.drawer.place_forget()
-            self.drawer_visible_state = False
-            self.settings_button.set("☷  Controls")
+    def _entry(self, parent, label, variable):
+        row = tk.Frame(parent, bg=SURFACE)
+        row.pack(fill="x", padx=10, pady=4)
+        self._label(row, label, size=9, color=MUTED, bg=SURFACE, width=10).pack(side="left")
+        holder = tk.Frame(row, bg=SURFACE_2, highlightthickness=1,
+                          highlightbackground=LINE, highlightcolor=TEAL)
+        holder.pack(side="right", fill="x", expand=True)
+        tk.Entry(holder, textvariable=variable, bg=SURFACE_2, fg=TEXT, bd=0,
+                 relief="flat", insertbackground=TEAL, font=font(10)).pack(
+            fill="x", padx=8, ipady=5)
+
+    def _slider(self, parent, label, variable, lo, hi):
+        row = tk.Frame(parent, bg=SURFACE)
+        row.pack(fill="x", padx=10, pady=(6, 0))
+        self._label(row, label, size=9, color="#B5CDD2", bg=SURFACE).pack(side="left")
+        value = self._label(row, str(variable.get()), size=9, color=TEAL,
+                            bg=SURFACE, anchor="e")
+        value.pack(side="right")
+        scale = tk.Scale(parent, variable=variable, from_=lo, to=hi,
+                         orient="horizontal", showvalue=False, resolution=1,
+                         bg=SURFACE, fg=TEXT, troughcolor="#16343C",
+                         activebackground=TEAL, highlightthickness=0, bd=0,
+                         sliderrelief="flat", sliderlength=18, width=8,
+                         command=lambda _v: value.configure(text=str(variable.get())))
+        scale.pack(fill="x", padx=10)
+
+    def _check(self, parent, label, variable):
+        tk.Checkbutton(parent, text=label, variable=variable, bg=SURFACE, fg=TEXT,
+                       selectcolor=SURFACE_2, activebackground=SURFACE,
+                       activeforeground=TEAL, bd=0, highlightthickness=0,
+                       font=font(9), anchor="w").pack(fill="x", padx=8, pady=2)
+
+    # ------------------------------------------------------------------
+    # CONNECTION
+    # ------------------------------------------------------------------
+    def toggle_connection(self):
+        if self.stream and self.stream.running:
+            self.disconnect_camera()
         else:
-            self.exit_fullscreen()
+            self.connect_camera()
 
     def connect_camera(self):
+        ip = self.camera_ip.get().strip()
         try:
-            ip = self.camera_ip.get().strip()
-            port = int(self.camera_port.get())
             socket.inet_aton(ip)
+            port = int(self.camera_port.get())
             if not 1 <= port <= 65535:
                 raise ValueError
-        except Exception:
-            messagebox.showerror("Camera Connection", "Please enter a valid IPv4 address and UDP port.", parent=self)
+        except (OSError, ValueError):
+            messagebox.showerror("Camera Connection",
+                                 "Please enter a valid IPv4 address and UDP port.")
             return
-        if self.stream:
-            self.stream.stop()
+
+        self.disconnect_camera(quiet=True)
         self.stream = ScopeStream(ip, port)
         self.stream.start()
-        self.connection_badge.config(text="● CONNECTING", fg=AMBER)
-        self.status_label.config(text=f"Listening for {ip}:{port} …")
-        self.empty_title.config(text="Waiting for camera")
-        self.empty_sub.config(text="Make sure the PC is connected to the scope Wi-Fi network")
+        self.connection_badge.set("CONNECTING", AMBER)
+        self.viewer_title.configure(text="WAITING", fg=AMBER)
+        self.status_label.configure(text=f"Listening for {ip}:{port}")
+        self._set_overlay_message(
+            "Waiting for camera",
+            "Make sure the PC is connected to the scope Wi-Fi network")
+        self._sync_overlay()
+        self._sync_connect_buttons()
 
-    def disconnect_camera(self):
+    def disconnect_camera(self, quiet=False):
         if self.recording:
             self.stop_recording()
         if self.stream:
             self.stream.stop()
-            self.stream = None
-        self.connection_badge.config(text="● OFFLINE", fg="#C16C79")
-        self.status_label.config(text="Camera disconnected")
-        self.viewer_meta.config(text="No signal")
+        self.stream = None
+        self.last_frame = None          # FIX 2: brings the overlay back
+        self.display_image = None
+        self.video_canvas.delete("all")
+        self.connection_badge.set("OFFLINE", MUTED)
+        self.viewer_title.configure(text="LIVE VIEW", fg=TEAL)
+        self.viewer_meta.configure(text="No signal")
+        self._set_overlay_message(
+            "Camera ready",
+            "Connect to the Wi-Fi scope to start live viewing")
+        self._sync_overlay()
+        self._sync_connect_buttons()
+        if not quiet:
+            self.status_label.configure(text="Camera disconnected")
 
+    def _sync_connect_buttons(self):
+        live = bool(self.stream and self.stream.running)
+        self.deck_connect_button.set_text("Disconnect" if live else "Connect")
+        self.deck_connect_button.set_kind("secondary" if live else "primary")
+
+    # ------------------------------------------------------------------
+    # FIX 2 - EMPTY-STATE OVERLAY VISIBILITY
+    # ------------------------------------------------------------------
+    def _set_overlay_message(self, title, subtitle):
+        children = self.empty_overlay.winfo_children()
+        if len(children) >= 2:
+            children[0].configure(text=title)
+            children[1].configure(text=subtitle)
+
+    def _sync_overlay(self, force=False):
+        """The welcome panel (and its Connect Camera button) is visible only
+        while there is no picture. One decoded frame hides it; disconnecting
+        or losing the stream brings it back. Calls are idempotent - place() is
+        only invoked when the state actually changes, which also removes a
+        second source of flicker."""
+        should_show = self.last_frame is None
+
+        # Lay out (or remove) only on a real change - repeated place() calls
+        # every tick would themselves cause flicker.
+        if force or should_show != self._overlay_shown:
+            self._overlay_shown = should_show
+            if should_show:
+                self.empty_overlay.place(relx=0.5, rely=0.5, anchor="center")
+                self.empty_overlay.lift()
+            else:
+                self.empty_overlay.place_forget()
+
+        # While the panel is on screen keep its button in step with the stream.
+        # set_text / set_enabled are no-ops when nothing changed.
+        if should_show:
+            connecting = bool(self.stream and self.stream.running)
+            self.overlay_button.set_text("Connecting..." if connecting
+                                         else "Connect Camera")
+            self.overlay_button.set_enabled(not connecting)
+
+    # ------------------------------------------------------------------
+    # FIX 3 - VIDEO-ONLY FULL SCREEN
+    # ------------------------------------------------------------------
+    def toggle_video_fullscreen(self):
+        if self.fs_window is not None:
+            self.close_video_fullscreen()
+        else:
+            self.open_video_fullscreen()
+
+    def open_video_fullscreen(self):
+        """Open a separate window that contains the video and nothing else.
+
+        The old behaviour set -fullscreen on the root window, so the header,
+        command deck and footer went full screen along with the picture. Here
+        a dedicated Toplevel holds a single black Canvas; the render loop
+        detects it and draws frames into it instead of the docked viewer.
+        """
+        if self.fs_window is not None:
+            return
+        win = tk.Toplevel(self.root)
+        win.configure(bg=BLACK)
+        win.title(f"{APP_NAME} - Video")
+        # Set an explicit screen-sized geometry as well as the fullscreen
+        # attribute, so the video window still covers the display if the
+        # window manager ignores -fullscreen.
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"{sw}x{sh}+0+0")
+        try:
+            win.attributes("-fullscreen", True)
+        except tk.TclError:
+            win.overrideredirect(True)
+
+        canvas = tk.Canvas(win, bg=BLACK, bd=0, highlightthickness=0,
+                           cursor="crosshair")
+        canvas.pack(fill="both", expand=True)
+        canvas.bind("<MouseWheel>", self.on_mouse_zoom)
+        canvas.bind("<Button-4>", lambda e: self.zoom_step(0.15))
+        canvas.bind("<Button-5>", lambda e: self.zoom_step(-0.15))
+        canvas.bind("<ButtonPress-1>", self.on_pan_start)
+        canvas.bind("<B1-Motion>", self.on_pan_move)
+        canvas.bind("<ButtonRelease-1>", self.on_pan_end)
+        canvas.bind("<Double-Button-1>", lambda _e: self.close_video_fullscreen())
+
+        win.bind("<Escape>", lambda _e: self.close_video_fullscreen())
+        win.bind("<F11>", lambda _e: self.close_video_fullscreen())
+        win.protocol("WM_DELETE_WINDOW", self.close_video_fullscreen)
+
+        hint = tk.Label(win, text="Esc or F11 to exit full screen",
+                        bg=BLACK, fg=DIM, font=font(9))
+        hint.place(relx=0.5, rely=1.0, y=-26, anchor="s")
+        win.after(2600, lambda: hint.destroy() if hint.winfo_exists() else None)
+
+        self.fs_window = win
+        self.fs_canvas = canvas
+        self.fullscreen_button.set_text("Exit Full Screen")
+        win.lift()
+        win.focus_force()
+
+    def close_video_fullscreen(self):
+        if self.fs_window is None:
+            return
+        try:
+            self.fs_window.destroy()
+        except tk.TclError:
+            pass
+        self.fs_window = None
+        self.fs_canvas = None
+        self.fs_image = None
+        self.fullscreen_button.set_text("Full Screen")
+
+    def _escape(self, _event=None):
+        if self.fs_window is not None:
+            self.close_video_fullscreen()
+        elif self.drawer_visible:
+            self.toggle_drawer()
+
+    # ------------------------------------------------------------------
+    # VIEW CONTROLS
+    # ------------------------------------------------------------------
     def toggle_freeze(self):
         self.freeze = not self.freeze
-        self.viewer_title.config(text="FROZEN FRAME" if self.freeze else "LIVE VIEW", fg=AMBER if self.freeze else TEXT)
-        self.status_label.config(text="Display frozen" if self.freeze else "Live display resumed")
+        if self.freeze:
+            self.viewer_title.configure(text="FROZEN FRAME", fg=AMBER)
+            self.freeze_button.set_text("Resume")
+            self.freeze_button.set_kind("primary")
+            self.status_label.configure(text="Display frozen")
+        else:
+            self.viewer_title.configure(text="LIVE VIEW", fg=TEAL)
+            self.freeze_button.set_text("Freeze")
+            self.freeze_button.set_kind("secondary")
+            self.status_label.configure(text="Live display resumed")
 
     def set_zoom(self, value):
-        self.zoom = float(max(0.5, min(4.0, value)))
+        self.zoom = max(1.0, min(float(value), 6.0))
         self.zoom_var.set(self.zoom)
-        if self.zoom <= 1.0:
+        if abs(self.zoom - 1.0) < 1e-6:
             self.pan_x = self.pan_y = 0
 
     def zoom_step(self, delta):
-        self.set_zoom(round(float(self.zoom_var.get()) + delta, 1))
+        self.set_zoom(round(self.zoom + delta, 2))
 
     def on_mouse_zoom(self, event):
-        self.zoom_step(0.1 if event.delta > 0 else -0.1)
+        self.zoom_step(0.15 if event.delta > 0 else -0.15)
 
     def on_pan_start(self, event):
-        if self.zoom <= 1.0:
-            return
         self.drag_start = (event.x, event.y, self.pan_x, self.pan_y)
 
     def on_pan_move(self, event):
-        if not self.drag_start or self.zoom <= 1.0:
+        if not self.drag_start:
             return
-        sx, sy, px, py = self.drag_start
-        self.pan_x = px + (event.x - sx)
-        self.pan_y = py + (event.y - sy)
+        x0, y0, px, py = self.drag_start
+        self.pan_x = px + (event.x - x0)
+        self.pan_y = py + (event.y - y0)
 
-    def on_pan_end(self, _event):
+    def on_pan_end(self, _event=None):
         self.drag_start = None
 
     def toggle_mirror(self):
         self.flip_h.set(not self.flip_h.get())
 
     def rotate_once(self):
-        vals = ["0°", "90°", "180°", "270°"]
-        idx = vals.index(self.rotate_var.get())
-        self.rotate_var.set(vals[(idx + 1) % len(vals)])
-
-    def toggle_fullscreen(self):
-        now = bool(self.attributes("-fullscreen"))
-        self.attributes("-fullscreen", not now)
-
-    def exit_fullscreen(self):
-        self.attributes("-fullscreen", False)
+        vals = ["0", "90", "180", "270"]
+        self.rotate_var.set(vals[(vals.index(self.rotate_var.get()) + 1) % 4])
 
     def reset_image(self):
         self.brightness_var.set(0)
-        self.contrast_var.set(1.0)
-        self.saturation_var.set(1.0)
-        self.gamma_var.set(1.0)
-        self.sharpness_var.set(0.0)
-        self.denoise_var.set(False)
+        self.contrast_var.set(0)
+        self.saturation_var.set(100)
+        self.gamma_var.set(100)
+        self.sharpness_var.set(0)
+        self.denoise_var.set(0)
         self.flip_h.set(False)
         self.flip_v.set(False)
-        self.rotate_var.set("0°")
+        self.rotate_var.set("0")
         self.grid_var.set(False)
         self.crosshair_var.set(False)
         self.timestamp_var.set(False)
         self.set_zoom(1.0)
-        self.status_label.config(text="Image and view controls reset")
+        self.pan_x = self.pan_y = 0
+        self.status_label.configure(text="Image and view controls reset")
 
+    # ------------------------------------------------------------------
+    # IMAGE PIPELINE
+    # ------------------------------------------------------------------
     def process_frame(self, frame, include_overlays=True):
-        img = frame.copy()
-        if self.flip_h.get() and self.flip_v.get():
-            img = cv2.flip(img, -1)
-        elif self.flip_h.get():
-            img = cv2.flip(img, 1)
-        elif self.flip_v.get():
-            img = cv2.flip(img, 0)
+        if frame is None:
+            return None
+        out = frame
+
+        if self.flip_h.get():
+            out = cv2.flip(out, 1)
+        if self.flip_v.get():
+            out = cv2.flip(out, 0)
 
         rot = self.rotate_var.get()
-        if rot == "90°":
-            img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-        elif rot == "180°":
-            img = cv2.rotate(img, cv2.ROTATE_180)
-        elif rot == "270°":
-            img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        if rot == "90":
+            out = cv2.rotate(out, cv2.ROTATE_90_CLOCKWISE)
+        elif rot == "180":
+            out = cv2.rotate(out, cv2.ROTATE_180)
+        elif rot == "270":
+            out = cv2.rotate(out, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-        img = cv2.convertScaleAbs(img, alpha=float(self.contrast_var.get()), beta=int(self.brightness_var.get()))
+        brightness = self.brightness_var.get()
+        contrast = self.contrast_var.get()
+        if brightness or contrast:
+            alpha = 1.0 + contrast / 100.0
+            out = cv2.convertScaleAbs(out, alpha=alpha, beta=float(brightness))
 
-        sat = float(self.saturation_var.get())
-        if abs(sat - 1.0) > 0.001:
-            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-            hsv[:, :, 1] *= sat
-            hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, 255)
-            img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        sat = self.saturation_var.get()
+        if sat != 100:
+            hsv = cv2.cvtColor(out, cv2.COLOR_BGR2HSV).astype(np.float32)
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (sat / 100.0), 0, 255)
+            out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
-        gamma = float(self.gamma_var.get())
-        if abs(gamma - 1.0) > 0.001:
-            inv = 1.0 / gamma
-            table = np.array([(i / 255.0) ** inv * 255 for i in range(256)], dtype=np.uint8)
-            img = cv2.LUT(img, table)
+        gamma = self.gamma_var.get()
+        if gamma != 100:
+            g = max(gamma, 1) / 100.0
+            table = np.array([((i / 255.0) ** (1.0 / g)) * 255
+                              for i in range(256)]).astype(np.uint8)
+            out = cv2.LUT(out, table)
 
-        if self.denoise_var.get():
-            img = cv2.bilateralFilter(img, 5, 35, 35)
+        denoise = self.denoise_var.get()
+        if denoise > 0:
+            d = int(3 + denoise / 20)
+            out = cv2.bilateralFilter(out, d, denoise, denoise)
 
-        sharp = float(self.sharpness_var.get())
+        sharp = self.sharpness_var.get()
         if sharp > 0:
-            blur = cv2.GaussianBlur(img, (0, 0), sigmaX=1.2)
-            img = cv2.addWeighted(img, 1.0 + sharp, blur, -sharp, 0)
-
-        z = max(0.5, float(self.zoom_var.get()))
-        if z > 1.0:
-            h, w = img.shape[:2]
-            cw, ch = max(20, int(w / z)), max(20, int(h / z))
-            cx = int(w / 2 - self.pan_x / z)
-            cy = int(h / 2 - self.pan_y / z)
-            x0 = max(0, min(w - cw, cx - cw // 2))
-            y0 = max(0, min(h - ch, cy - ch // 2))
-            img = img[y0:y0+ch, x0:x0+cw]
+            blur = cv2.GaussianBlur(out, (0, 0), sigmaX=1.2)
+            out = cv2.addWeighted(out, 1 + sharp / 100.0, blur, -sharp / 100.0, 0)
 
         if include_overlays:
-            h, w = img.shape[:2]
+            h, w = out.shape[:2]
+            overlay_color = (200, 230, 235)
             if self.grid_var.get():
-                overlay = img.copy()
-                for x in (w // 3, 2 * w // 3):
-                    cv2.line(overlay, (x, 0), (x, h), (75, 160, 160), 1, cv2.LINE_AA)
-                for y in (h // 3, 2 * h // 3):
-                    cv2.line(overlay, (0, y), (w, y), (75, 160, 160), 1, cv2.LINE_AA)
-                img = cv2.addWeighted(img, 0.88, overlay, 0.12, 0)
+                for i in (1, 2):
+                    cv2.line(out, (w * i // 3, 0), (w * i // 3, h),
+                             overlay_color, 1, cv2.LINE_AA)
+                    cv2.line(out, (0, h * i // 3), (w, h * i // 3),
+                             overlay_color, 1, cv2.LINE_AA)
             if self.crosshair_var.get():
-                cv2.line(img, (w//2-28, h//2), (w//2+28, h//2), (110, 235, 225), 1, cv2.LINE_AA)
-                cv2.line(img, (w//2, h//2-28), (w//2, h//2+28), (110, 235, 225), 1, cv2.LINE_AA)
+                cx, cy = w // 2, h // 2
+                cv2.line(out, (cx - 26, cy), (cx + 26, cy), overlay_color, 1, cv2.LINE_AA)
+                cv2.line(out, (cx, cy - 26), (cx, cy + 26), overlay_color, 1, cv2.LINE_AA)
+                cv2.rectangle(out, (cx - 26, cy - 26), (cx + 26, cy + 26),
+                              overlay_color, 1, cv2.LINE_AA)
             if self.timestamp_var.get():
-                cv2.rectangle(img, (10, h-35), (275, h-8), (3, 10, 12), -1)
-                cv2.putText(img, datetime.now().strftime("%d %b %Y  %H:%M:%S"), (17, h-16), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (235, 250, 250), 1, cv2.LINE_AA)
-        return img
+                stamp = datetime.now().strftime("%d %b %Y  %H:%M:%S")
+                cv2.putText(out, stamp, (14, h - 16), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(out, stamp, (14, h - 16), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        return out
 
-    def _render_fit(self, frame):
-        cw = max(300, self.video_canvas.winfo_width())
-        ch = max(240, self.video_canvas.winfo_height())
+    def _render_fit(self, frame, cw, ch):
+        """Scale `frame` into a cw x ch canvas honouring zoom and pan."""
         h, w = frame.shape[:2]
-        scale = min(cw / w, ch / h)
-        nw, nh = max(1, int(w*scale)), max(1, int(h*scale))
-        resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
-        canvas = np.zeros((ch, cw, 3), np.uint8)
-        x, y = (cw-nw)//2, (ch-nh)//2
-        canvas[max(y,0):max(y,0)+nh, max(x,0):max(x,0)+nw] = resized
+        if w == 0 or h == 0 or cw <= 1 or ch <= 1:
+            return None
+        scale = min(cw / w, ch / h) * self.zoom
+        nw, nh = max(int(w * scale), 1), max(int(h * scale), 1)
+        interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+        resized = cv2.resize(frame, (nw, nh), interpolation=interp)
+
+        canvas = np.zeros((ch, cw, 3), dtype=np.uint8)
+        canvas[:] = (10, 8, 3)
+
+        ox = (cw - nw) // 2 + int(self.pan_x)
+        oy = (ch - nh) // 2 + int(self.pan_y)
+        sx0, sy0 = max(0, -ox), max(0, -oy)
+        dx0, dy0 = max(0, ox), max(0, oy)
+        cw_copy = min(nw - sx0, cw - dx0)
+        ch_copy = min(nh - sy0, ch - dy0)
+        if cw_copy > 0 and ch_copy > 0:
+            canvas[dy0:dy0 + ch_copy, dx0:dx0 + cw_copy] = \
+                resized[sy0:sy0 + ch_copy, sx0:sx0 + cw_copy]
         return canvas
 
-    def render(self, frame):
-        processed = self.process_frame(frame, include_overlays=True)
-        canvas = self._render_fit(processed)
-        self.empty_title.place_forget()
-        self.empty_sub.place_forget()
-        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(rgb)
-        self.display_image = ImageTk.PhotoImage(image=image)
-        self.video_canvas.delete("video")
-        self.video_canvas.create_image(0, 0, image=self.display_image, anchor="nw", tags="video")
-        self.viewer_meta.config(text=f"Zoom {self.zoom:.1f}×   •   {self.display_fps:.0f} fps")
-        if self.recording:
-            elapsed = int(time.time() - self.record_started)
-            self.viewer_rec.config(text=f"● REC  {elapsed//60:02d}:{elapsed%60:02d}")
-        else:
-            self.viewer_rec.config(text="")
+    def render(self):
+        """Draw the current frame into whichever canvas is active."""
+        fullscreen = self.fs_canvas is not None
+        canvas = self.fs_canvas if fullscreen else self.video_canvas
 
+        self._sync_overlay()
+        if self.last_frame is None:
+            return
+
+        cw, ch = canvas.winfo_width(), canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+
+        processed = self.process_frame(self.last_frame, include_overlays=True)
+        if processed is None:
+            return
+
+        # feed the recorder with the processed (overlay-burned) frame
+        if self.recording and self.writer is not None:
+            try:
+                self.writer.write(processed)
+                self.record_frames += 1
+            except Exception as exc:
+                self.status_label.configure(text=f"Recording error: {exc}")
+
+        fitted = self._render_fit(processed, cw, ch)
+        if fitted is None:
+            return
+        rgb = cv2.cvtColor(fitted, cv2.COLOR_BGR2RGB)
+        photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+
+        canvas.delete("video")
+        canvas.create_image(0, 0, image=photo, anchor="nw", tags="video")
+        if fullscreen:
+            self.fs_image = photo          # keep a reference alive
+        else:
+            self.display_image = photo
+
+    # ------------------------------------------------------------------
+    # CAPTURE
+    # ------------------------------------------------------------------
     def capture_snapshot(self):
         if self.last_frame is None:
-            messagebox.showwarning("Snapshot", "No camera frame is available yet.", parent=self)
+            messagebox.showwarning(APP_NAME, "No camera frame is available yet.")
             return
+        frame = self.process_frame(self.last_frame, include_overlays=True)
+        out_dir = Path(self.save_dir_var.get())
         try:
-            out_dir = Path(self.save_dir_var.get())
             out_dir.mkdir(parents=True, exist_ok=True)
-            processed = self.process_frame(self.last_frame, True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             path = out_dir / f"CARE_ENT_Scope_{stamp}.jpg"
-            if not cv2.imwrite(str(path), processed, [cv2.IMWRITE_JPEG_QUALITY, 97]):
+            if not cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95]):
                 raise RuntimeError("JPEG save failed")
-            self.status_label.config(text=f"Snapshot saved: {path.name}")
-        except Exception as exc:
-            messagebox.showerror("Snapshot", f"Could not save snapshot.\n\n{exc}", parent=self)
+            self.status_label.configure(text=f"Snapshot saved: {path.name}")
+        except Exception:
+            messagebox.showwarning(APP_NAME, "Could not save snapshot.")
 
     def toggle_record(self):
-        self.stop_recording() if self.recording else self.start_recording()
+        if self.recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
 
     def start_recording(self):
         if self.last_frame is None:
-            messagebox.showwarning("Video Recording", "No camera frame is available yet.", parent=self)
+            messagebox.showwarning("Video Recording", "No camera frame is available yet.")
             return
-        try:
-            VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            frame = self.process_frame(self.last_frame, True)
-            h, w = frame.shape[:2]
-            fps = max(10.0, min(30.0, self.display_fps or 20.0))
-            path = VIDEO_DIR / f"CARE_ENT_Scope_{stamp}.mp4"
-            writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-            if not writer.isOpened():
-                writer.release()
-                path = VIDEO_DIR / f"CARE_ENT_Scope_{stamp}.avi"
-                writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (w, h))
-            if not writer.isOpened():
-                raise RuntimeError("No compatible video encoder is available.")
-            self.writer = writer
-            self.recording = True
-            self.record_path = path
-            self.record_started = time.time()
-            self.record_frames = 0
-            self.last_record_id = -1
-            self.record_button.set("■  Stop Recording", kind="danger")
-            self.status_label.config(text=f"Recording started: {path.name}")
-        except Exception as exc:
-            messagebox.showerror("Video Recording", str(exc), parent=self)
+        frame = self.process_frame(self.last_frame, include_overlays=True)
+        h, w = frame.shape[:2]
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fps = max(self.display_fps, 12.0)
+
+        for fourcc_name, suffix in (("mp4v", ".mp4"), ("MJPG", ".avi")):
+            path = VIDEO_DIR / f"CARE_ENT_Scope_{stamp}{suffix}"
+            writer = cv2.VideoWriter(str(path),
+                                     cv2.VideoWriter_fourcc(*fourcc_name),
+                                     fps, (w, h))
+            if writer.isOpened():
+                self.writer = writer
+                self.record_path = path
+                break
+            writer.release()
+        else:
+            messagebox.showwarning("Video Recording",
+                                   "No compatible video encoder is available.")
+            return
+
+        self.recording = True
+        self.record_started = time.time()
+        self.record_frames = 0
+        self.record_button.set_text("Stop Recording")
+        self.record_button.set_kind("danger")
+        self.status_label.configure(text=f"Recording started: {self.record_path.name}")
 
     def stop_recording(self):
-        if self.writer:
+        if not self.recording:
+            return
+        self.recording = False
+        if self.writer is not None:
             try:
                 self.writer.release()
             except Exception:
                 pass
-        path = self.record_path
-        frames = self.record_frames
         self.writer = None
-        self.recording = False
-        self.record_path = None
-        self.record_button.set("●  Start Recording", kind="secondary")
-        if path:
-            self.status_label.config(text=f"Recording saved: {path.name}  •  {frames} frames")
+        self.record_button.set_text("Start Recording")
+        self.record_button.set_kind("secondary")
+        self.viewer_rec.configure(text="")
+        if self.record_path:
+            self.status_label.configure(
+                text=f"Recording saved: {self.record_path.name} - {self.record_frames} frames")
 
     def choose_save_folder(self):
-        folder = filedialog.askdirectory(initialdir=self.save_dir_var.get(), title="Choose capture folder")
+        folder = filedialog.askdirectory(title="Choose capture folder",
+                                         initialdir=self.save_dir_var.get())
         if folder:
             self.save_dir_var.set(folder)
-            Path(folder).mkdir(parents=True, exist_ok=True)
-            self.status_label.config(text=f"Capture folder: {folder}")
+            self.status_label.configure(text=f"Capture folder: {folder}")
 
-    @staticmethod
-    def open_folder(path):
-        p = Path(path).expanduser()
-        p.mkdir(parents=True, exist_ok=True)
+    def open_folder(self, path):
+        path = os.path.expanduser(str(path))
         try:
-            os.startfile(str(p))
+            os.startfile(path)                       # Windows
         except AttributeError:
-            subprocess.Popen(["xdg-open", str(p)])
+            subprocess.Popen(["xdg-open", path])     # other platforms
+        except Exception:
+            self.status_label.configure(text="Could not open the folder.")
 
-    def show_about(self):
-        import webbrowser
-        win = tk.Toplevel(self)
-        win.title("About CARE ENT Scope Camera")
-        win.configure(bg=BG)
-        win.geometry("820x620")
-        win.minsize(760, 560)
-        win.transient(self)
-        win.grab_set()
-        win.update_idletasks()
-        try:
-            x = self.winfo_x() + max(0, (self.winfo_width() - win.winfo_width()) // 2)
-            y = self.winfo_y() + max(0, (self.winfo_height() - win.winfo_height()) // 2)
-            win.geometry(f"{win.winfo_width()}x{win.winfo_height()}+{x}+{y}")
-        except tk.TclError:
-            pass
-
-        hero = tk.Frame(win, bg=SURFACE, height=116)
-        hero.pack(fill="x")
-        hero.pack_propagate(False)
-
-        logo = tk.Canvas(hero, width=70, height=70, bg=SURFACE, highlightthickness=0)
-        logo.pack(side="left", padx=(24, 16), pady=22)
-        logo.create_oval(4, 4, 66, 66, fill=TEAL_SOFT, outline=TEAL, width=2)
-        logo.create_text(35, 35, text="C", fill=TEAL, font=("Arial", 27, "bold"))
-
-        head = tk.Frame(hero, bg=SURFACE)
-        head.pack(side="left", pady=18)
-        tk.Label(head, text="CARE ENT Scope Camera", bg=SURFACE, fg=TEXT,
-                 font=("Arial", 22, "bold")).pack(anchor="w")
-        tk.Label(head, text=f"Professional Windows camera workstation   •   v{APP_VERSION}",
-                 bg=SURFACE, fg="#78BBC1", font=("Arial", 9)).pack(anchor="w", pady=(4, 0))
-        tk.Label(head, text="Developed by Dr. Abrar Khan  •  Care Hospital, Chikhli",
-                 bg=SURFACE, fg=MUTED, font=("Arial", 9)).pack(anchor="w", pady=(5, 0))
-
-        body = tk.Frame(win, bg=BG)
-        body.pack(fill="both", expand=True, padx=22, pady=(18, 8))
-        body.grid_columnconfigure(0, minsize=180)
-        body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(0, weight=1)
-
-        nav = tk.Frame(body, bg=SURFACE_2, highlightthickness=1, highlightbackground=LINE)
-        nav.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        tk.Label(nav, text="ABOUT", bg=SURFACE_2, fg=MUTED, font=("Arial", 8, "bold")).pack(anchor="w", padx=16, pady=(18, 8))
-
-        content = tk.Frame(body, bg=SURFACE_2, highlightthickness=1, highlightbackground=LINE)
-        content.grid(row=0, column=1, sticky="nsew")
-
-        content_title = tk.Label(content, text="Overview", bg=SURFACE_2, fg=TEXT,
-                                 font=("Arial", 17, "bold"))
-        content_title.pack(anchor="w", padx=22, pady=(20, 4))
-        content_sub = tk.Label(content, text="", bg=SURFACE_2, fg=MUTED, font=("Arial", 9))
-        content_sub.pack(anchor="w", padx=22)
-        content_text = tk.Label(content, text="", bg=SURFACE_2, fg="#C8DDE1", justify="left", anchor="nw",
-                                wraplength=520, font=("Arial", 9), pady=16)
-        content_text.pack(fill="both", expand=True, padx=22)
-        action_row = tk.Frame(content, bg=SURFACE_2)
-        action_row.pack(fill="x", padx=22, pady=(0, 18))
-
-        pages = {
-            "Overview": (
-                "Purpose and capabilities",
-                "Professional live viewing, capture and documentation workspace",
-                "CARE ENT Scope Camera is a Windows companion viewer for the Wi-Fi ENT endoscope camera used in the CARE ENT Scope workflow.\n\n"
-                "It receives the camera's local-network video stream and provides a focused workstation for live viewing, image capture and local video recording.\n\n"
-                "Key capabilities\n"
-                "• Live scope video and connection status\n"
-                "• High-quality JPEG snapshots and local video recording\n"
-                "• Zoom, pan, fit-to-view, mirror and rotation\n"
-                "• Brightness, contrast, saturation, gamma and sharpness\n"
-                "• Optional denoise, grid, crosshair and timestamp overlays\n"
-                "• Freeze frame and full-screen viewing\n\n"
-                "The viewer is designed as a practical camera workstation and does not require a cloud account for live display."
-            ),
-            "Privacy & Use": (
-                "Local data and clinical use",
-                "Patient media remains under the control of the Windows workstation",
-                "Images and videos are saved to the local folder selected in the application. The camera viewer does not require cloud storage for live viewing.\n\n"
-                "Clinical use notice\n"
-                "This application is a camera viewing and documentation aid. It does not by itself establish a diagnosis, issue a prescription or replace professional clinical judgement.\n\n"
-                "Users are responsible for appropriate patient consent, confidentiality and compliance with applicable privacy requirements when patient media is captured or stored."
-            ),
-            "Technical": (
-                "Camera and software details",
-                "Implementation information for support and deployment",
-                "Camera transport\n"
-                "Bebird-type Wi-Fi ENT scope stream received over UDP. Default endpoint: 192.168.10.123 : 8030.\n\n"
-                "Media\n"
-                "Snapshots are stored as high-quality JPEG files. Video is recorded locally using the available Windows/OpenCV video encoder with MP4 preferred and AVI/MJPEG fallback.\n\n"
-                f"Application\nCARE ENT Scope Camera v{APP_VERSION} · Windows desktop application · local processing and local media storage.\n\n"
-                "Support\n+91 9370111449   ·   www.carehospital.in"
-            ),
-            "Copyright": (
-                "Intellectual property",
-                "Ownership and software notice",
-                "© 2026 Care Hospital. All rights reserved.\n\n"
-                "CARE ENT Scope Camera is proprietary software developed by Dr. Abrar Khan at Care Hospital, Chikhli. The application interface, workflow and software implementation are part of the CARE ENT Scope software environment.\n\n"
-                "This About page is provided for software identification, support and usage notice."
-            ),
-        }
-
-        def set_page(name):
-            title, subtitle, text = pages[name]
-            content_title.config(text=name)
-            content_sub.config(text=subtitle)
-            content_text.config(text=text)
-            for n, item in nav_items.items():
-                item.configure(bg=TEAL_DARK if n == name else SURFACE_2,
-                               fg=TEXT if n == name else "#A8C7CC")
-
-        nav_items = {}
-        for name in pages:
-            lbl = tk.Label(nav, text=name, bg=SURFACE_2, fg="#A8C7CC", anchor="w",
-                           font=("Arial", 9, "bold"), cursor="hand2")
-            lbl.pack(fill="x", padx=10, pady=3, ipady=9)
-            lbl.bind("<Button-1>", lambda _e, n=name: set_page(n))
-            lbl.bind("<Enter>", lambda _e, w=lbl: w.configure(bg=TEAL_SOFT))
-            lbl.bind("<Leave>", lambda _e, w=lbl, n=name: w.configure(bg=TEAL_DARK if n == content_title.cget("text") else SURFACE_2))
-            nav_items[name] = lbl
-
-        tk.Frame(nav, bg=SURFACE_2).pack(fill="both", expand=True)
-        tk.Label(nav, text="CARE ENT", bg=SURFACE_2, fg=TEAL, font=("Arial", 9, "bold")).pack(anchor="w", padx=16)
-        tk.Label(nav, text="Chikhli", bg=SURFACE_2, fg=MUTED, font=("Arial", 8)).pack(anchor="w", padx=16, pady=(2, 16))
-
-        ModernButton(action_row, "Visit Website", lambda: webbrowser.open("https://www.carehospital.in"), width=136, height=36, icon="↗").pack(side="left")
-        ModernButton(action_row, "Copy Support", lambda: self._copy_support(win), width=136, height=36, icon="▣").pack(side="left", padx=8)
-        ModernButton(action_row, "Close", win.destroy, width=100, height=36, icon="×").pack(side="right")
-
-        set_page("Overview")
-
-    def _copy_support(self, parent):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append("+91 9370111449")
-            self.update()
-            self.status_label.config(text="Support number copied to clipboard")
-        except tk.TclError:
-            messagebox.showinfo("Support", "+91 9370111449", parent=parent)
-
+    # ------------------------------------------------------------------
+    # MAIN LOOP
+    # ------------------------------------------------------------------
     def ui_tick(self):
         if self.closed:
             return
-        if self.stream:
-            frame, frame_id = self.stream.get_frame()
-            if frame is not None:
-                if not self.freeze:
+        try:
+            if self.stream:
+                frame, fid = self.stream.get_frame()
+                if frame is not None and not self.freeze:
                     self.last_frame = frame
-                if self.last_frame is not None:
-                    self.render(self.last_frame)
-                if self.recording and self.writer is not None and frame_id != self.last_record_id and not self.freeze:
-                    try:
-                        self.writer.write(self.process_frame(self.last_frame, True))
-                        self.record_frames += 1
-                        self.last_record_id = frame_id
-                    except Exception as exc:
-                        self.status_label.config(text=f"Recording error: {exc}")
-                        self.stop_recording()
+                    if fid != self.last_frame_counter:
+                        self.frames_since += 1
+                        self.last_frame_counter = fid
 
             now = time.time()
-            if now - self.last_fps_time >= 1.0:
-                self.display_fps = (self.stream.frame_count - self.last_frame_counter) / (now - self.last_fps_time)
-                self.last_frame_counter = self.stream.frame_count
+            if now - self.last_fps_time >= 0.5:
+                self.display_fps = self.frames_since / (now - self.last_fps_time)
+                self.frames_since = 0
                 self.last_fps_time = now
-                age = now - self.stream.last_frame_time if self.stream.last_frame_time else 999
-                if self.stream.last_frame_time and age < 1.5:
-                    self.connection_badge.config(text="● LIVE", fg=GREEN)
-                    self.viewer_meta.config(text=f"{self.stream.ip}:{self.stream.port}   •   {self.display_fps:.0f} fps   •   Zoom {self.zoom:.1f}×")
-                    self.empty_title.place_forget()
-                    self.empty_sub.place_forget()
-                elif self.stream.running:
-                    self.connection_badge.config(text="● WAITING", fg=AMBER)
-                else:
-                    self.connection_badge.config(text="● OFFLINE", fg="#C16C79")
-                self.status_label.config(text=(
-                    f"{self.stream.ip}:{self.stream.port}   •   {self.display_fps:.0f} fps   •   "
-                    f"Packets {self.stream.pkt_count:,}   •   Frames {self.stream.frame_count:,}   •   Decoded {self.stream.decode_ok:,}"
-                ))
-        self.after(40, self.ui_tick)
+
+            self.render()
+            self._update_chrome(now)
+        except tk.TclError:
+            return
+        except Exception:
+            pass
+        self.root.after(30, self.ui_tick)
+
+    def _update_chrome(self, now):
+        live = bool(self.stream and self.stream.running)
+        has_signal = live and self.last_frame is not None and \
+            (now - self.stream.last_frame_time) < 2.5
+
+        if not live:
+            self.connection_badge.set("OFFLINE", MUTED)
+        elif has_signal:
+            self.connection_badge.set("LIVE", GREEN)
+        else:
+            self.connection_badge.set("CONNECTING", AMBER)
+
+        show_chrome = self.chrome_var.get()
+        for widget in (self.viewer_title, self.viewer_meta, self.viewer_rec):
+            if show_chrome:
+                widget.lift()
+            else:
+                widget.lower()
+
+        if not self.freeze and live:
+            self.viewer_title.configure(
+                text="LIVE VIEW" if has_signal else "WAITING",
+                fg=TEAL if has_signal else AMBER)
+
+        if self.stream:
+            self.viewer_meta.configure(
+                text=(f"{self.display_fps:.0f} fps    Zoom {self.zoom:.1f}x    "
+                      f"Packets {self.stream.pkt_count}    "
+                      f"Frames {self.stream.frame_count}    "
+                      f"Decoded {self.stream.decode_ok}"))
+
+        if self.recording:
+            elapsed = int(now - self.record_started)
+            self.viewer_rec.configure(
+                text=f"REC  {elapsed // 60:02d}:{elapsed % 60:02d}")
 
     def on_close(self):
         self.closed = True
+        self.close_video_fullscreen()
         if self.recording:
             self.stop_recording()
         if self.stream:
             self.stream.stop()
-        self.destroy()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------------
+    # ABOUT
+    # ------------------------------------------------------------------
+    def show_about(self):
+        win = tk.Toplevel(self.root)
+        win.title(f"About {APP_NAME}")
+        win.configure(bg=BG)
+        win.geometry("860x640")
+        win.transient(self.root)
+        win.update_idletasks()
+        win.geometry(f"+{self.root.winfo_x() + 120}+{self.root.winfo_y() + 70}")
+
+        hero = tk.Frame(win, bg=BG)
+        hero.pack(fill="x", padx=28, pady=(24, 12))
+        self._label(hero, APP_NAME, size=18, weight="bold", bg=BG).pack(anchor="w")
+        self._label(hero, f"Professional Windows camera workstation   -   v{APP_VERSION}",
+                    size=10, color="#78BBC1", bg=BG).pack(anchor="w", pady=(4, 0))
+        self._label(hero, f"Developed by {APP_AUTHOR}  -  {APP_VENDOR}",
+                    size=9, color=MUTED, bg=BG).pack(anchor="w", pady=(6, 0))
+
+        card = RoundedPanel(win, radius=16, fill=SURFACE, border=LINE, bg=BG)
+        card.pack(fill="both", expand=True, padx=28, pady=(6, 12))
+        body = card.body
+
+        pages = {
+            "Overview": (
+                "Purpose and capabilities",
+                "CARE ENT Scope Camera is a Windows companion viewer for the Wi-Fi ENT "
+                "endoscope camera used in the CARE ENT Scope workflow. It receives the "
+                "camera's local-network video stream and provides a focused workstation "
+                "for live viewing, image capture and local video recording.\n\n"
+                "Key capabilities\n"
+                "  -  Live scope video and connection status\n"
+                "  -  High-quality JPEG snapshots and local video recording\n"
+                "  -  Zoom, pan, fit-to-view, mirror and rotation\n"
+                "  -  Brightness, contrast, saturation, gamma and sharpness\n"
+                "  -  Optional denoise, grid, crosshair and timestamp overlays\n"
+                "  -  Freeze frame and video-only full-screen viewing\n\n"
+                "The viewer is designed as a practical camera workstation and does not "
+                "require a cloud account for live display."),
+            "Privacy & Use": (
+                "Local data and clinical use",
+                "Patient media remains under the control of the Windows workstation. "
+                "Images and videos are saved to the local folder selected in the "
+                "application. The camera viewer does not require cloud storage for live "
+                "viewing.\n\n"
+                "Clinical use notice\n"
+                "This application is a camera viewing and documentation aid. It does not "
+                "by itself establish a diagnosis, issue a prescription or replace "
+                "professional clinical judgement.\n\n"
+                "Users are responsible for appropriate patient consent, confidentiality "
+                "and compliance with applicable privacy requirements when patient media "
+                "is captured or stored."),
+            "Technical": (
+                "Camera and software details",
+                f"Camera transport\n"
+                f"Bebird-type Wi-Fi ENT scope stream received over UDP. Default endpoint: "
+                f"{CAMERA_IP_DEFAULT} : {CAMERA_PORT_DEFAULT}.\n\n"
+                "Media\n"
+                "Snapshots are stored as high-quality JPEG files. Video is recorded "
+                "locally using the available Windows/OpenCV video encoder with MP4 "
+                "preferred and AVI/MJPEG fallback.\n\n"
+                "Application\n"
+                f"{APP_NAME} v{APP_VERSION} - Windows desktop application with local "
+                "processing and local media storage.\n\n"
+                "Support\n"
+                f"{APP_PHONE}   -   {APP_WEB}"),
+            "Copyright": (
+                "Ownership and software notice",
+                "(c) 2026 Care Hospital. All rights reserved.\n\n"
+                f"{APP_NAME} is proprietary software developed by {APP_AUTHOR} at "
+                f"{APP_VENDOR}. The application interface, workflow and software "
+                "implementation are part of the CARE ENT Scope software environment.\n\n"
+                "This About page is provided for software identification, support and "
+                "usage notice."),
+        }
+
+        nav = tk.Frame(body, bg=SURFACE)
+        nav.pack(side="left", fill="y", padx=16, pady=16)
+        content = tk.Frame(body, bg=SURFACE)
+        content.pack(side="left", fill="both", expand=True, padx=(4, 18), pady=16)
+
+        content_title = self._label(content, "", size=12, weight="bold", bg=SURFACE)
+        content_title.pack(anchor="w")
+        content_text = self._label(content, "", size=9, color="#C8DDE1", bg=SURFACE,
+                                   justify="left", wraplength=520)
+        content_text.pack(anchor="w", pady=(10, 0))
+
+        nav_buttons = {}
+
+        def set_page(name):
+            subtitle, text = pages[name]
+            content_title.configure(text=subtitle)
+            content_text.configure(text=text)
+            for key, btn in nav_buttons.items():
+                btn.set_kind("primary" if key == name else "ghost")
+
+        for name in pages:
+            btn = RoundButton(nav, text=name, kind="ghost", width=150,
+                              command=lambda n=name: set_page(n), bg=SURFACE)
+            btn.pack(anchor="w", pady=3)
+            nav_buttons[name] = btn
+        set_page("Overview")
+
+        actions = tk.Frame(win, bg=BG)
+        actions.pack(fill="x", padx=28, pady=(0, 20))
+        RoundButton(actions, text="Visit Website", kind="secondary",
+                    command=lambda: __import__("webbrowser").open(f"https://{APP_WEB}"),
+                    bg=BG).pack(side="left", padx=(0, 8))
+        RoundButton(actions, text="Copy Support Number", kind="secondary",
+                    command=self._copy_support, bg=BG).pack(side="left")
+        RoundButton(actions, text="Close", kind="primary",
+                    command=win.destroy, bg=BG).pack(side="right")
+
+    def _copy_support(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(APP_PHONE)
+        messagebox.showinfo("Support", "Support number copied to clipboard")
+
+
+# ==========================================================================
+def main():
+    root = tk.Tk()
+    CameraApp(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    CameraApp().mainloop()
+    main()
